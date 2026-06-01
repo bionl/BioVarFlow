@@ -1,0 +1,7 @@
+[submodule "external/sarek"]
+	path = external/sarek
+	url = https://github.com/nf-core/sarek.git
+[submodule "external/db_export"]
+	path = external/db_export
+	url = https://github.com/bionl/bionl_lean_db_export.git
+	branch = export

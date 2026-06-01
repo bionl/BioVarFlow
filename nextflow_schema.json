@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/alkhatib93/Bionl_Lean_Call/main/nextflow_schema.json",
+  "title": "Bionl_Lean_Call parameters",
+  "description": "A germline variant-calling workflow focused on ACMG Secondary Findings (research use only), with standardized QC, annotation, and per-sample reports.",
+  "type": "object",
+
+  "$defs": {
+    "io_options": {
+      "title": "Input / Output",
+      "type": "object",
+      "fa_icon": "fas fa-folder-open",
+      "properties": {
+        "input": {
+          "type": "string",
+          "title": "Samplesheet CSV",
+          "description": "CSV file for variant calling input (required).",
+          "mimetype": "text/csv",
+          "format": "file-path",
+          "pattern": "^\\S*\\.csv$"
+        },
+        "outdir": {
+          "type": "string",
+          "title": "Output directory",
+          "description": "Where to write results (local path or gs://).",
+          "format": "directory-path"
+        },
+        "run_id": {
+          "type": "string",
+          "title": "Run identifier",
+          "description": "Identifier for this pipeline run. Written into the first column of ${outdir}/manifest/run_output_manifest.tsv. If omitted, Nextflow's auto-generated workflow.runName is used."
+        }
+      }
+    }
+  },
+
+  "allOf": [
+    { "$ref": "#/$defs/io_options" }
+  ],
+
+  "required": ["input", "outdir"],
+  "additionalProperties": true
+}
