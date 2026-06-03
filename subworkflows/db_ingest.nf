@@ -80,7 +80,7 @@ workflow DB_INGEST {
         ch_variants_script = Channel.value(
             file("${workflow.projectDir}/external/db_export/bins/db_vep_vcf_to_variants_all.py")
         )
-        EXTRACT_VARIANTS(VEP_ANNOTATE_DB.out.vep_vcf, ch_variants_script)
+        EXTRACT_VARIANTS(VEP_Annotate_DB.out.vep_vcf, ch_variants_script)
 
         // ── Step 3: BAM coverage ──────────────────────────────────────────
         ch_bam_input = ch_pass.map { meta, vcf, bam, bai -> [ meta, bam, bai ] }
