@@ -21,8 +21,8 @@ nextflow.enable.dsl = 2
 include { EXTRACT_VARIANTS    } from '../external/db_export/modules/extract_variants'
 include { MOSDEPTH_THRESHOLDS } from '../external/db_export/modules/mosdepth_thresholds'
 include { CONVERT_THRESHOLDS  } from '../external/db_export/modules/thresholds_to_coverage'
-include { LOAD_VARIANTS       } from '../external/db_export/modules/load_variants'
-include { LOAD_DENSE_DEPTH    } from '../external/db_export/modules/load_dense_depth'
+include { LOAD_VARIANTS       } from '../modules/load_variants'
+include { LOAD_DENSE_DEPTH    } from '../modules/load_dense_depth'
 
 workflow DB_INGEST {
     take:
