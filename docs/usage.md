@@ -4,7 +4,7 @@
 
 ## Pipeline Overview
 
-**Bionl_Lean_Call** is a Nextflow workflow for germline variant calling,
+**BioVarFlow** is a Nextflow workflow for germline variant calling,
 quality control, consensus integration, and ACMG Secondary Findings reporting.
 
 The pipeline runs from FASTQ files using a standardized samplesheet.
@@ -41,10 +41,10 @@ Patient002,WES,XY,0,Sample_B,data/sample_B_R1.fastq.gz,data/sample_B_R2.fastq.gz
 ```
 
 **Column Descriptions:**
-- `patient`: Patient identifier (can be the same for multiple samples)
-- `assay`: Assay type - use `WES`(Whole Exome Sequencing) or `WGS` (Whole genome sequencing)
-- `sex`: Biological sex - use `XX` (female), `XY` (male), or `0` (unknown)
-- `status`: Disease status - `0` (unaffected) or `1` (affected) (Define always as 0)
+- `patient`: Patient identifier (can be shared across multiple samples)
+- `assay`: Assay type — `WES` (Whole Exome Sequencing) or `WGS` (Whole Genome Sequencing)
+- `sex`: Biological sex — `XX` (female), `XY` (male), or `0` (unknown)
+- `status`: Disease status — always set to `0`
 - `sample`: Unique sample identifier
 - `fastq_1`: Full path to R1 FASTQ file
 - `fastq_2`: Full path to R2 FASTQ file
@@ -98,9 +98,8 @@ outdir/
 ```bash
 nextflow run main.nf \
   --input samples.csv \
-  --outdir results \
+  --outdir results
 ```
-
 
 ---
 # Validated Configuration (GIAB Benchmarking)
@@ -195,7 +194,6 @@ Criteria:
 
 ---
 
-
 ## Getting Help
 
 If you encounter issues:
@@ -204,5 +202,3 @@ If you encounter issues:
 2. Review `.command.log` files in failed task directories
 3. Contact your bioinformatics support team
 4. Email: khatib@bionl.ai
-
-

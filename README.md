@@ -1,22 +1,22 @@
-# Bionl_Lean_Call
+# BioVarFlow
 
-Germline variant calling and reporting for ACMG SF genes, including QC and functional annotation—designed for research, not diagnostic use.
+Germline variant calling and reporting with standardized QC and functional annotation — designed for research, not diagnostic use.
 
 ---
 ## Overview
 
-**Bionl_Lean_Call** is a Nextflow-based pipeline designed to produce high-quality germline variant calls and structured reports for research and data integration workflows.
+**BioVarFlow** is a Nextflow-based pipeline designed to produce high-quality germline variant calls and structured reports for research and data integration workflows.
 
 Main Features:
 
-- Alignment using **BWA-MEM**
+- Alignment using **BWA-MEM2**
 - Variant calling with:
   - DeepVariant
   - GATK HaplotypeCaller
 - Consensus variant integration
 - ACMG region filtering
 - Coverage and QC analysis
-- Functional annotation
+- Functional annotation (VEP)
 - Excel and HTML reporting outputs
 
 ---
@@ -35,14 +35,15 @@ The pipeline runs from FASTQ files using a standardized samplesheet.
 patient,assay,sex,status,sample,fastq_1,fastq_2,lane
 Patient001,WES,XX,0,Sample_A,data/sample_A_R1.fastq.gz,data/sample_A_R2.fastq.gz,1
 Patient002,WES,XY,0,Sample_B,data/sample_B_R1.fastq.gz,data/sample_B_R2.fastq.gz,1
-Patient003,WES,XX,1,Sample_C,data/sample_C_R1.fastq.gz,data/sample_C_R2.fastq.gz,1
+Patient003,WES,XX,0,Sample_C,data/sample_C_R1.fastq.gz,data/sample_C_R2.fastq.gz,1
 ```
 
 The CSV should include:
 - **patient**: Patient identifier
-- **sex**: Sex (XX for female, XY for male, or 0 if unknown)
-- **status**: Affected status (0 for unaffected, 1 for affected) - define it always 0
-- **sample**: Sample identifier (must be unique)
+- **assay**: Assay type (`WES` or `WGS`)
+- **sex**: Sex (`XX` for female, `XY` for male, or `0` if unknown)
+- **status**: Always set to `0`
+- **sample**: Unique sample identifier
 - **fastq_1**: Path to forward reads file
 - **fastq_2**: Path to reverse reads file
 - **lane**: Sequencing lane number
@@ -63,10 +64,10 @@ outdir/
 
 **What you'll find:**
 
-- **VCF files**: 
+- **VCF files**:
   - Filtered and annotated VCF files
-  - Consensus integration of DeppVariant and HaplotypeCaller calls
-- **QC metrics**: 
+  - Consensus integration of DeepVariant and HaplotypeCaller calls
+- **QC metrics**:
   - Coverage analysis (20x, 30x, 50x, 100x thresholds)
   - Coverage gaps identification
   - Alignment statistics (mapped reads, duplicates)
@@ -84,17 +85,15 @@ outdir/
 1. Navigate to the pipeline in your platform interface
 2. Specify your **input samplesheet** path
 3. Specify your **output directory** path
-4. Click **Run Worfklow**
+4. Click **Run Workflow**
 
-### Command Line Examples
+### Command Line
 
 ```bash
 nextflow run main.nf \
   --input samples.csv \
   --outdir results
 ```
-
-That's it! The pipeline handles everything else automatically.
 
 ---
 # Benchmarking
@@ -115,7 +114,7 @@ Target Regions:
 - ACMG SF v3.3 BED
 
 Pipeline Configuration:
-- Aligner: BWA-MEM
+- Aligner: BWA-MEM2
 - Variant Callers: DeepVariant + GATK HaplotypeCaller
 - Strategy: Consensus variant integration (DV+HC)
 - Filtering:
@@ -124,7 +123,7 @@ Pipeline Configuration:
   - PASS variants only
 
 ## Performance Summary (ACMG Regions)
-### SNPS
+### SNPs
 
 | Metric | Result |
 |---|---|
@@ -132,7 +131,7 @@ Pipeline Configuration:
 | Recall | 99.5% |
 | F1 Score | 97.1% |
 
-### INDELS
+### INDELs
 
 | Metric | Result |
 |---|---|
@@ -144,11 +143,7 @@ Benchmarking was performed against GIAB high-confidence truth sets using hap.py.
 
 ## Reproducibility
 
-To reproduce validated results, use the configuration shown in `USAGE.md`.
-
-## Full Validation Documentation
-
-See detailed validation report: docs/validation/GIAB_validation_report.md
+To reproduce validated results, use the configuration shown in `docs/usage.md`.
 
 ## Support
 
@@ -156,4 +151,4 @@ For questions or assistance:
 - Contact your bioinformatics team
 - Email: khatib@bionl.ai
 
-**Pipeline version**: 1.0.0
+**Pipeline version**: 1.1.0

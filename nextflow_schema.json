@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/alkhatib93/Bionl_Lean_Call/main/nextflow_schema.json",
-  "title": "Bionl_Lean_Call parameters",
-  "description": "A germline variant-calling workflow focused on ACMG Secondary Findings (research use only), with standardized QC, annotation, and per-sample reports.",
+  "$id": "https://raw.githubusercontent.com/bionl/BioVarFlow/main/nextflow_schema.json",
+  "title": "BioVarFlow parameters",
+  "description": "A germline variant-calling workflow with standardized QC, annotation, and per-sample reports.",
   "type": "object",
 
   "$defs": {
@@ -29,13 +29,6 @@
           "type": "string",
           "title": "Run identifier",
           "description": "Identifier for this pipeline run. Written into the first column of ${outdir}/manifest/run_output_manifest.tsv. If omitted, Nextflow's auto-generated workflow.runName is used."
-        },
-        "bins_bed": {
-          "type": "string",
-          "title": "Exon bins BED file",
-          "description": "BED file of unique MANE exon bins used by mosdepth for per-base coverage (MANE_bins_unique_exon.bed). Required for DB ingestion — provide a local path or gs:// URI when the file is not bundled in the repo.",
-          "format": "file-path",
-          "pattern": "^\\S*\\.bed$"
         }
       }
     }

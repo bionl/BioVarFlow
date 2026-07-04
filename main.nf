@@ -22,9 +22,6 @@ include { DB_QC_EXPORT } \
 include { MANIFEST } \
   from './modules/manifest.nf'
 
-include { DB_INGEST } \
-  from './subworkflows/db_ingest.nf'
-
 // ═══════════════════════════════════════════════════════════════════════════
 // PARAMETERS & VALIDATION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -36,7 +33,6 @@ params.bed                    = params.bed ?: "${workflow.projectDir}/data/annot
 //params.run_variant_calling    = params.run_variant_calling instanceof Boolean ? params.run_variant_calling : true
 params.create_consensus       = params.create_consensus instanceof Boolean ? params.create_consensus : true
 params.run_db_qc              = params.run_db_qc instanceof Boolean ? params.run_db_qc : true
-params.run_db_ingest          = params.run_db_ingest instanceof Boolean ? params.run_db_ingest : true
 // Run identifier propagated to the run-output manifest (consumed by the
 // downstream DB ingestion pipeline). Falls back to workflow.runName at
 // manifest-build time if left null.
@@ -379,10 +375,7 @@ workflow RUN_FULL_VARIANT_CALLING {
             params.help_full,
             params.show_hidden,
         )
-        // Build sample -> assay map from the validated sarek samplesheet channel
 
-        // PIPELINE_INITIALISATION.out.samplesheet is a channel emitting rows (maps/objects)
-        // Build sample -> assay map from PIPELINE_INITIALISATION.out.samplesheet
         def assayMap = [:]
 
         PIPELINE_INITIALISATION.out.samplesheet
@@ -396,6 +389,7 @@ workflow RUN_FULL_VARIANT_CALLING {
                 log.info "✓ Loaded assay metadata for ${assayMap.size()} sample(s)"
                 assayMap.each { k, v -> log.info "  ${k} -> ${v}" }
             }
+
         NFCORE_SAREK(PIPELINE_INITIALISATION.out.samplesheet)
 
         PIPELINE_COMPLETION(
@@ -408,37 +402,27 @@ workflow RUN_FULL_VARIANT_CALLING {
             NFCORE_SAREK.out.multiqc_report
         )
 
-        // Collect variant calling outputs
         COLLECT_VARIANT_CALLING_OUTPUTS(
             NFCORE_SAREK.out.multiqc_report,
             params.outdir
         )
 
-        // Create consensus VCF if enabled
         if (params.create_consensus) {
             ref_fasta_ch = Channel.value(file(params.ref_fasta))
-            ref_fai_ch = Channel.value(file(params.ref_fasta + ".fai"))
-            
+            ref_fai_ch   = Channel.value(file(params.ref_fasta + ".fai"))
+
             CONSENSUS_CALLING(
                 COLLECT_VARIANT_CALLING_OUTPUTS.out.dv_vcf,
                 COLLECT_VARIANT_CALLING_OUTPUTS.out.hc_vcf,
                 ref_fasta_ch,
                 ref_fai_ch
             )
-            
+
             final_vcf_ch = CONSENSUS_CALLING.out.consensus_vcf
         } else {
-            // Use DeepVariant VCFs by default (or could use HC, make configurable)
             final_vcf_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.dv_vcf
         }
 
-        // Run post-processing
-        //POST_SAREK(
-        //    final_vcf_ch, 
-        //    COLLECT_VARIANT_CALLING_OUTPUTS.out.bam, 
-        //    bed_ch
-        //)
-        // Attach meta (sample + assay) to channels for downstream reporting
         def vcf_with_meta_ch = final_vcf_ch.map { sample, vcf ->
             def meta = [ sample: sample, assay: assayMap.get(sample, 'NA') ]
             tuple(meta, vcf)
@@ -449,10 +433,6 @@ workflow RUN_FULL_VARIANT_CALLING {
             tuple(meta, bam, bai)
         }
 
-
-        // QC export — reuses Sarek's alignment/coverage QC outputs,
-        // only runs bcftools stats on the consensus VCF.
-        // Runs in parallel with POST_SAREK, never blocks it.
         if (params.run_db_qc) {
             def alignment_qc_meta_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.alignment_qc
                 .map { sample, f, type ->
@@ -474,25 +454,15 @@ workflow RUN_FULL_VARIANT_CALLING {
                 mosdepth_dist_meta_ch
             )
 
-            // Final run-output manifest. Aggregates per-sample tuples of
-            // (final VCF, coverage BAM, QC JSON) into a single TSV, then
-            // DB_INGEST runs the db_export pipeline for READY samples.
             MANIFEST(
                 vcf_with_meta_ch,
                 bam_with_meta_ch,
                 DB_QC_EXPORT.out.qc_json
             )
-
-            if (params.run_db_ingest) {
-                DB_INGEST(MANIFEST.out.manifest)
-            } else {
-                log.info "params.run_db_ingest=false → skipping DB ingestion. Manifest written to ${params.outdir}/manifest/run_output_manifest.tsv"
-            }
         } else {
-            log.warn "params.run_db_qc=false → skipping manifest and DB ingestion (QC Gate JSON is required)."
+            log.warn "params.run_db_qc=false → skipping run_output_manifest.tsv (QC Gate JSON is required to populate qc_status / qc_recommendation)."
         }
 
-        // Run post-processing (meta-aware) — all samples always continue here
         POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
 }
 
