@@ -173,7 +173,7 @@ class ExcelDataReader:
         # Set defaults for missing data
         header_data.setdefault('assay', 'WES')
         header_data.setdefault('reference_build', 'GRCh38')
-        header_data.setdefault('pipeline', 'Bionl_Lean_call v1.0')
+        header_data.setdefault('pipeline', 'BioVarFlow v1.1.0')
         header_data.setdefault('databases', 'ClinVar (2025-01), gnomAD v4.1, Ensembl VEP Release 115, REVEL (latest release), AlphaMissense (Science 2023, updated 2025-05)')
 
         return header_data
