@@ -29,6 +29,13 @@
           "type": "string",
           "title": "Run identifier",
           "description": "Identifier for this pipeline run. Written into the first column of ${outdir}/manifest/run_output_manifest.tsv. If omitted, Nextflow's auto-generated workflow.runName is used."
+        },
+        "input_bam": {
+          "type": "string",
+          "title": "BAM samplesheet (start from mapped data)",
+          "description": "CSV samplesheet with already-mapped BAM files. When provided, the pipeline skips alignment and starts from markduplicates. Required columns: patient, sex, status, sample, bam, bai. Mutually exclusive with --input.",
+          "format": "file-path",
+          "pattern": "^\\S*\\.csv$"
         }
       }
     }
@@ -38,6 +45,6 @@
     { "$ref": "#/$defs/io_options" }
   ],
 
-  "required": ["input", "outdir"],
+  "required": ["outdir"],
   "additionalProperties": true
 }
