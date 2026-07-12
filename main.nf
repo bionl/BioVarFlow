@@ -358,12 +358,21 @@ workflow RUN_FULL_VARIANT_CALLING {
         bed_ch
 
     main:
-        log.info """
+        if (params.somatic_mode) {
+            log.info """
+        ╔════════════════════════════════════════════════════════════╗
+        ║  Running somatic variant calling pipeline (Sarek/Mutect2)  ║
+        ║  Tumor-only and tumor+normal pairs supported               ║
+        ╚════════════════════════════════════════════════════════════╝
+        """.stripIndent()
+        } else {
+            log.info """
         ╔════════════════════════════════════════════════════════════╗
         ║  Running full variant calling pipeline (Sarek)             ║
         ║  Consensus calling: ${params.create_consensus ? 'ENABLED' : 'DISABLED'}
         ╚════════════════════════════════════════════════════════════╝
         """.stripIndent()
+        }
 
         PIPELINE_INITIALISATION(
             params.version,
@@ -407,7 +416,15 @@ workflow RUN_FULL_VARIANT_CALLING {
             params.outdir
         )
 
-        if (params.create_consensus) {
+        if (params.somatic_mode) {
+            def isGCS = isGcsPath(params.outdir)
+            final_vcf_ch = NFCORE_SAREK.out.multiqc_report
+                .flatMap {
+                    file("${params.outdir}/variant_calling/mutect2/*/*.mutect2.filtered.vcf.gz", checkIfExists: !isGCS)
+                }
+                .filter { vcf -> vcf.name.endsWith('.vcf.gz') && !vcf.name.endsWith('.tbi') }
+                .map { vcf -> tuple(vcf.parent.name, vcf) }
+        } else if (params.create_consensus) {
             ref_fasta_ch = Channel.value(file(params.ref_fasta))
             ref_fai_ch   = Channel.value(file(params.ref_fasta + ".fai"))
 
@@ -463,7 +480,10 @@ workflow RUN_FULL_VARIANT_CALLING {
             log.warn "params.run_db_qc=false → skipping run_output_manifest.tsv (QC Gate JSON is required to populate qc_status / qc_recommendation)."
         }
 
-        POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
+        // POST_SAREK (VEP annotation) is germline-only — skip in somatic mode
+        if (!params.somatic_mode) {
+            POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
+        }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
