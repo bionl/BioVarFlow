@@ -445,9 +445,23 @@ workflow RUN_FULL_VARIANT_CALLING {
             tuple(meta, vcf)
         }
 
-        def bam_with_meta_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.bam.map { sample, bam, bai ->
-            def meta = [ sample: sample, assay: assayMap.get(sample, 'NA') ]
-            tuple(meta, bam, bai)
+        // When starting from BAM files, Sarek writes markdup outputs to
+        // preprocessing/markduplicates/ not preprocessing/mapped/, so we read
+        // BAMs directly from the input samplesheet instead.
+        def bam_with_meta_ch
+        if (params.input_bam) {
+            bam_with_meta_ch = Channel
+                .fromPath(params.input_bam, checkIfExists: true)
+                .splitCsv(header: true)
+                .map { row ->
+                    def meta = [ sample: row.sample, assay: assayMap.get(row.sample, 'NA') ]
+                    tuple(meta, file(row.bam), file(row.bai))
+                }
+        } else {
+            bam_with_meta_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.bam.map { sample, bam, bai ->
+                def meta = [ sample: sample, assay: assayMap.get(sample, 'NA') ]
+                tuple(meta, bam, bai)
+            }
         }
 
         if (params.run_db_qc) {
