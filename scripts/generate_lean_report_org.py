@@ -26,6 +26,10 @@ p.add_argument("--mosdepth-summary", default=None, help="mosdepth *.summary.txt 
 p.add_argument("--verifybamid", default=None, help="verifyBamID2 *.selfSM or .summary output (FREEMIX)")
 p.add_argument("--sexcheck", default=None, help="file with inferred sex (one line like: Sex: Male)")
 p.add_argument("--sf-genes", default=None, help="ACMG SF gene list (one gene SYMBOL per line)")
+p.add_argument("--hemonc-genes", default=None,
+               help="HemOnc gene list (one gene SYMBOL per line). "
+                    "When provided, three extra sheets are written: 'HemOnc (P-LP)', "
+                    "'HemOnc Coverage gaps', 'HemOnc Genes Coverage'.")
 p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
@@ -324,11 +328,25 @@ def read_acmg_thresholds(th_path, sf_genes=None):
 import os
 import pandas as pd
 
-def acmg_pct_regions_covered(th_path, min_depth=20):
+def acmg_pct_regions_covered(th_path, min_depth=20, gene_set=None, key_prefix="ACMG"):
     """
-    Compute % of ACMG regions fully covered at >= min_depth using mosdepth thresholds output.
+    Compute % of regions fully covered at >= min_depth using mosdepth thresholds output.
     Expects columns like: #chrom, start, end, region, 10X, 20X, 30X, ...
-    Returns: {"ACMG_PctRegionsCovered": 97.35, "ACMG_RegionsCovered": N, "ACMG_RegionsTotal": M}
+
+    Parameters
+    ----------
+    gene_set : iterable[str] or None
+        If provided, restrict the calculation to rows whose `region` column
+        starts with a GENE symbol in this set (assumes `GENE|TRANSCRIPT` labels
+        in the source BED). If None, all regions are used (legacy behaviour).
+    key_prefix : str
+        Prefix for the returned metric keys. Default "ACMG" preserves the
+        legacy keys ("ACMG_PctRegionsCovered", ...). Pass e.g. "HemOnc" to
+        produce parallel HemOnc-scoped metrics.
+
+    Returns
+    -------
+    dict with keys: {prefix}_PctRegionsCovered, {prefix}_RegionsCovered, {prefix}_RegionsTotal
     """
     out = {}
     if not th_path or not os.path.exists(th_path):
@@ -355,6 +373,17 @@ def acmg_pct_regions_covered(th_path, min_depth=20):
 
     if chrom is None or start is None or end is None:
         return out
+
+    # 3b) Optional gene-set scoping: keep only rows whose region label's gene
+    #     portion (before the first '|') is in gene_set.
+    if gene_set:
+        if region_col and region_col in df.columns:
+            gene_series = df[region_col].astype(str).str.split("|", n=1).str[0]
+            df = df[gene_series.isin(set(gene_set))].copy()
+        # If no region column exists we can't scope by gene → keep behaviour
+        # equivalent to "no rows match" so metrics reflect the empty scope.
+        else:
+            df = df.iloc[0:0].copy()
 
     # 4) Find the threshold column (prefer exact "20X", else any col whose digits == 20)
     preferred = f"{int(min_depth)}X"
@@ -395,9 +424,9 @@ def acmg_pct_regions_covered(th_path, min_depth=20):
     covered = int((grp["thr_sum"] >= grp["len_sum"]).sum())
     pct = round(covered / total_regions * 100.0, 2)
 
-    out["ACMG_PctRegionsCovered"] = pct
-    out["ACMG_RegionsCovered"] = covered
-    out["ACMG_RegionsTotal"] = total_regions
+    out[f"{key_prefix}_PctRegionsCovered"] = pct
+    out[f"{key_prefix}_RegionsCovered"] = covered
+    out[f"{key_prefix}_RegionsTotal"] = total_regions
     return out
 
 
@@ -659,6 +688,14 @@ if args.sf_genes and os.path.exists(args.sf_genes):
             g = l.strip().split()[0]
             if g: sf_genes.add(g)
 
+# Optional HemOnc gene list (BioVarFlow_HemOnc branch)
+hemonc_genes = set()
+if args.hemonc_genes and os.path.exists(args.hemonc_genes):
+    with open(args.hemonc_genes) as f:
+        for l in f:
+            g = l.strip().split()[0] if l.strip() else ""
+            if g and not g.startswith("#"): hemonc_genes.add(g)
+
 # -------------------------
 # Parse VCF to dataframe
 # -------------------------
@@ -799,7 +836,17 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     tmp = parse_picard_insert(args.picard_insert);    ss.update({k:v for k,v in tmp.items() if v is not None})
     # Mosdepth means
     ss.update(parse_mosdepth_summary_regions(args.mosdepth_summary))
-    ss.update(acmg_pct_regions_covered(args.acmg_thresholds))
+    # Scope the ACMG region-coverage metric to the ACMG SF gene set (so it isn't
+    # diluted by HemOnc regions when using a merged ACMG+HemOnc BED). Fall back
+    # to the legacy "all regions" behaviour when no SF list is provided.
+    ss.update(acmg_pct_regions_covered(args.acmg_thresholds,
+                                       gene_set=sf_genes if sf_genes else None,
+                                       key_prefix="ACMG"))
+    # Parallel HemOnc-scoped metric (only emitted when a HemOnc list is provided).
+    if hemonc_genes:
+        ss.update(acmg_pct_regions_covered(args.acmg_thresholds,
+                                           gene_set=hemonc_genes,
+                                           key_prefix="HemOnc"))
     # Contamination & sex
     ss.update(parse_verifybamid(args.verifybamid))
     ss.update(parse_sexcheck(args.sexcheck))
@@ -822,69 +869,116 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
 
     pd.DataFrame([ss]).to_excel(xw, index=False, sheet_name="Sample Summary")
 
-    # 2) ACMG SF (P/LP) — filter by ClinVar and (optionally) SF gene list
-    
-    acmg = df.copy()
-    acmg["ClinVar_URL"] = acmg.apply(clinvar_url_from_row, axis=1)
-
+    # ---------------------------------------------------------------
+    # Helper: write the three per-gene-set sheets (variants, coverage
+    # gaps, per-gene rollup). Shared by the ACMG SF and HemOnc blocks.
+    # ---------------------------------------------------------------
     def make_hyperlink(u):
         return f'=HYPERLINK("{u}","{u}")' if u else ""
 
-    acmg["ClinVar_Link"] = acmg["ClinVar_URL"].map(make_hyperlink)
-    if "ClinVar" in acmg.columns:
-        acmg = acmg[acmg["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)]
-    else:
-        acmg = acmg.iloc[0:0]
-    if sf_genes:
-        acmg = acmg[acmg["Gene"].isin(sf_genes)]
-    acmg_cols = [
+    variant_cols = [
         "Gene","Variant","HGVSc","HGVSp","MANE_ID","Zygosity","GT","AD_Ref","AD_Alt","DP","GQ","QUAL",
         "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full"
     ]
-    acmg[acmg_cols].to_excel(xw, index=False, sheet_name="ACMG SF (P-LP)")
-
-    # 3) Coverage gaps in ACMG SF genes (or all genes if no list)
-    combined_df = pd.DataFrame(columns=[
+    empty_gaps_cols = [
         "Gene","MANE_ID","Exon","RegionLabel","Chrom","ExonStart","ExonEnd","ExonLen",
         "Pct>=20x","Pct>=30x",
         "Gaps<20x_n","Gaps<20x_bp","Gaps<20x_intervals",
         "Gaps<30x_n","Gaps<30x_bp","Gaps<30x_intervals"
-    ])
+    ]
 
-    try:
-        th_exon = read_acmg_thresholds(args.acmg_thresholds, sf_genes=sf_genes)  # RegionLabel = chrom:start-end if no names
-        g20_agg = load_gap_bed_for_agg(args.gaps20, "<20x", sf_genes=sf_genes)
-        g30_agg = load_gap_bed_for_agg(args.gaps30, "<30x", sf_genes=sf_genes)
+    def write_gene_set_sheets(gene_set, variants_sheet, gaps_sheet, genes_cov_sheet):
+        """
+        Emit three sheets to the open ExcelWriter `xw`, scoped to `gene_set`:
+          1. `variants_sheet`   — ClinVar-pathogenic variants in genes of `gene_set`
+          2. `gaps_sheet`       — per-exon coverage + gap intervals for genes of `gene_set`
+          3. `genes_cov_sheet`  — per-gene length-weighted %≥20x rollup
 
-        combined_df = (th_exon
-                       .merge(g20_agg, on="RegionLabel", how="left")
-                       .merge(g30_agg, on="RegionLabel", how="left"))
+        An empty `gene_set` produces the legacy "no gene filter" behaviour for
+        the variants sheet (kept for backwards compatibility with existing
+        ACMG runs that omit --sf-genes). Coverage-gap sheets are always
+        gene-scoped when a set is provided (they can't sensibly be "all
+        genes" because thresholds/gaps files come from the merged BED).
+        """
+        # ---- variants sheet ----
+        variants = df.copy()
+        variants["ClinVar_URL"] = variants.apply(clinvar_url_from_row, axis=1)
+        variants["ClinVar_Link"] = variants["ClinVar_URL"].map(make_hyperlink)
+        if "ClinVar" in variants.columns:
+            variants = variants[variants["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)]
+        else:
+            variants = variants.iloc[0:0]
+        if gene_set:
+            variants = variants[variants["Gene"].isin(gene_set)]
+        variants[variant_cols].to_excel(xw, index=False, sheet_name=variants_sheet)
 
-        # ensure all expected columns exist
-        for c in ["Gaps<20x_n","Gaps<20x_bp","Gaps<20x_intervals","Gaps<30x_n","Gaps<30x_bp","Gaps<30x_intervals"]:
-            if c not in combined_df.columns: combined_df[c] = pd.NA
+        # ---- coverage gaps sheet ----
+        combined = pd.DataFrame(columns=empty_gaps_cols)
+        try:
+            th_exon = read_acmg_thresholds(args.acmg_thresholds, sf_genes=gene_set)  # gene-filtered
+            g20_agg = load_gap_bed_for_agg(args.gaps20, "<20x", sf_genes=gene_set)
+            g30_agg = load_gap_bed_for_agg(args.gaps30, "<30x", sf_genes=gene_set)
 
-        combined_df = (combined_df[
-            ["Gene","MANE_ID","Exon","Chrom","ExonStart","ExonEnd","ExonLen",
-             "Pct>=20x","Pct>=30x",
-             "Gaps<20x_n","Gaps<20x_bp","Gaps<20x_intervals",
-             "Gaps<30x_n","Gaps<30x_bp","Gaps<30x_intervals"]]
-            .sort_values(["Chrom","ExonStart","ExonEnd"])
+            combined = (th_exon
+                        .merge(g20_agg, on="RegionLabel", how="left")
+                        .merge(g30_agg, on="RegionLabel", how="left"))
+
+            for c in ["Gaps<20x_n","Gaps<20x_bp","Gaps<20x_intervals",
+                      "Gaps<30x_n","Gaps<30x_bp","Gaps<30x_intervals"]:
+                if c not in combined.columns:
+                    combined[c] = pd.NA
+
+            combined = (combined[
+                ["Gene","MANE_ID","Exon","Chrom","ExonStart","ExonEnd","ExonLen",
+                 "Pct>=20x","Pct>=30x",
+                 "Gaps<20x_n","Gaps<20x_bp","Gaps<20x_intervals",
+                 "Gaps<30x_n","Gaps<30x_bp","Gaps<30x_intervals"]]
+                .sort_values(["Chrom","ExonStart","ExonEnd"])
+            )
+        except Exception:
+            pass
+
+        combined.to_excel(xw, index=False, sheet_name=gaps_sheet)
+
+        # ---- per-gene rollup sheet ----
+        try:
+            genes_cov = build_genes_coverage(combined, sf_genes=gene_set if gene_set else None)
+        except Exception:
+            genes_cov = pd.DataFrame(columns=["Gene","MANE_ID","Pct20"])
+
+        # Ensure every gene in `gene_set` appears in the rollup — genes with
+        # no coverage data (e.g. because the mosdepth BED used at run time
+        # didn't include them) show up with Pct20 = NaN. This keeps the sheet
+        # honest about scope so downstream consumers (HTML report grid) can
+        # render "NA" for unmeasured genes rather than silently omitting them.
+        if gene_set:
+            all_genes = pd.DataFrame({"Gene": sorted(gene_set)})
+            genes_cov = (all_genes.merge(genes_cov, on="Gene", how="left")
+                                  .fillna({"MANE_ID": "NA"}))
+            # Pct20 stays NaN for genes with no data (excluded from fillna on
+            # purpose) so downstream code can distinguish "unmeasured" from
+            # "measured and 0%".
+
+        genes_cov.to_excel(xw, index=False, sheet_name=genes_cov_sheet)
+
+    # 2-4) ACMG SF sheets (existing behaviour, sheet names preserved for
+    # backwards compatibility with the HTML report reader).
+    write_gene_set_sheets(
+        gene_set=sf_genes,
+        variants_sheet="ACMG SF (P-LP)",
+        gaps_sheet="Coverage gaps",
+        genes_cov_sheet="ACMG SF Genes Coverage",
+    )
+
+    # 4b) HemOnc sheets (BioVarFlow_HemOnc branch). Only written when a
+    # HemOnc gene list was supplied via --hemonc-genes.
+    if hemonc_genes:
+        write_gene_set_sheets(
+            gene_set=hemonc_genes,
+            variants_sheet="HemOnc (P-LP)",
+            gaps_sheet="HemOnc Coverage gaps",
+            genes_cov_sheet="HemOnc Genes Coverage",
         )
-    except Exception:
-        pass
-
-    combined_df.to_excel(xw, index=False, sheet_name="Coverage gaps")
-
-    # 4) Build from the thresholds-per-exon table if you have it
-    try:
-        # If you still have `th_exon` in scope (output of read_acmg_thresholds), this is best:
-        genes_cov = build_genes_coverage(combined_df, sf_genes=sf_genes if len(sf_genes)>0 else None)
-    except Exception:
-        # Otherwise fall back to the combined_df you already created for Coverage gaps
-        genes_cov = build_genes_coverage(combined_df, sf_genes=sf_genes if len(sf_genes)>0 else None)
-
-    genes_cov.to_excel(xw, index=False, sheet_name="ACMG SF Genes Coverage")
 
     # 5) PASS variant table
     pass_cols = [

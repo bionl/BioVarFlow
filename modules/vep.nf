@@ -2,7 +2,9 @@
 nextflow.enable.dsl=2
 
 // -------- Parameters (used by processes) --------
-params.bed         = params.bed         ?: "${workflow.projectDir}/data/annotated_merged_MANE_deduped.bed"
+params.bed         = params.bed         ?: "${workflow.projectDir}/data/annotated_merged_MANE_deduped_ALL.bed"
+params.sf_genes    = params.sf_genes    ?: "${workflow.projectDir}/data/acmg_sf_gene_list.txt"
+params.hemonc_genes= params.hemonc_genes?: "${workflow.projectDir}/data/hemonc.txt"
 params.outdir      = params.outdir      ?: "results"
 params.scriptdir   = params.scriptdir   ?: "${workflow.projectDir}/scripts"
 params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/template-files"
@@ -398,6 +400,8 @@ process LeanReport {
           path(gaps20), path(gaps30),
           path(thresholds)
     each path(script)
+    each path(sf_genes_file)
+    each path(hemonc_genes_file)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants_lean.xlsx")
   script:
@@ -411,6 +415,8 @@ process LeanReport {
     --mosdepth-summary ${mosdepth_summary} \
     --acmg-thresholds ${thresholds} \
     --sexcheck ${sex_check} \
+    --sf-genes ${sf_genes_file} \
+    --hemonc-genes ${hemonc_genes_file} \
     --gaps20 ${gaps20} --gaps30 ${gaps30}
   """
 }
@@ -452,6 +458,11 @@ workflow POST_SAREK {
     script_ch = Channel.fromPath("${params.scriptdir}/generate_lean_report_org.py").first()
     report_script_ch = Channel.fromPath("${params.scriptdir}/python-skeleton/", type: 'dir').first()
     template_dir_ch = Channel.fromPath("${params.template_dir}", type: 'dir').first()
+    // Gene-set lists for the lean report. Staged as value channels so Nextflow
+    // stages them into every LeanReport task (works both locally and on cloud).
+    // Overridable via --sf_genes / --hemonc_genes (defaults in params block above).
+    sf_genes_ch     = Channel.fromPath(params.sf_genes).first()
+    hemonc_genes_ch = Channel.fromPath(params.hemonc_genes).first()
     // VCF path
     BedFilterVCF(sample_inputs.map { s, vcf, bam, bai -> tuple(s, vcf) }, bed_ch)
     NormalizeVCF(BedFilterVCF.out)
@@ -510,6 +521,6 @@ workflow POST_SAREK {
       .join(gaps20_ch)
       .join(gaps30_ch)
       .join(thresholds_ch)
-    LeanReport(lean_input_ch, script_ch)
+    LeanReport(lean_input_ch, script_ch, sf_genes_ch, hemonc_genes_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 }

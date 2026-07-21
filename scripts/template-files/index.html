@@ -199,8 +199,124 @@
     </main>
   </div>
 
-  <!-- Page 4 - Methods & Limitations -->
-  <div class="page page-4">
+  <!-- ================================================================= -->
+  <!-- HemOnc pages (BioVarFlow_HemOnc branch)                            -->
+  <!-- These three pages mirror the ACMG SF layout above but scope to a  -->
+  <!-- curated hematology/oncology predisposition gene set. They render  -->
+  <!-- with empty/placeholder content on ACMG-only runs.                 -->
+  <!-- ================================================================= -->
+
+  <!-- Page 4 - HemOnc Clinical Relevant Variants -->
+  <div class="page page-hemonc-1">
+    <header class="page-header">
+      <h2>HemOnc germline variants of possible clinical relevance</h2>
+    </header>
+
+    <main class="report-content">
+      <section class="variants-section">
+        <p class="section-description">
+          Variants listed below are classified as (likely) pathogenic on ClinVar with a minimum 2 stars rating.
+          The list is restricted to a curated set of hematology/oncology predisposition genes (HemOnc).
+        </p>
+
+        <div class="table-container">
+          <table class="variants-table">
+            <thead>
+              <tr>
+                <th>Gene</th>
+                <th>HGVSc</th>
+                <th>HGVSp</th>
+              </tr>
+            </thead>
+            <tbody>
+              <!-- HEMONC_VARIANTS_HIGH_START -->
+              <tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>
+              <!-- HEMONC_VARIANTS_HIGH_END -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Page 5 - HemOnc Variants for Further Analysis -->
+  <div class="page page-hemonc-2">
+    <header class="page-header">
+      <h2>HemOnc variants for further analysis</h2>
+    </header>
+
+    <main class="report-content">
+      <section class="variants-section">
+        <p class="section-description">
+          Variants listed below are classified as (likely) pathogenic on ClinVar with less than 2 stars rating,
+          have conflicting classifications, or are classified as variants of uncertain significance.
+        </p>
+      </section>
+
+      <div class="table-container">
+        <table class="variants-table">
+          <thead>
+            <tr>
+              <th>Gene</th>
+              <th>HGVSc</th>
+              <th>HGVSp</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- HEMONC_VARIANTS_LOW_START -->
+            <tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>
+            <!-- HEMONC_VARIANTS_LOW_END -->
+          </tbody>
+        </table>
+      </div>
+    </main>
+  </div>
+
+  <!-- Page 6 - HemOnc Coverage -->
+  <div class="page page-hemonc-3">
+    <header class="page-header">
+      <h2>HemOnc coverage</h2>
+    </header>
+
+    <main class="report-content">
+      <div class="qc-container">
+        <div class="qc-left">
+          <h3>HemOnc coverage summary</h3>
+          <div class="metrics-table-container">
+            <table class="metrics-table">
+              <tbody>
+                <tr>
+                  <td class="metric-label">HemOnc Covered Percent</td>
+                  <!-- HEMONC_COVERED_PCT_START --><td class="metric-value">—</td><!-- HEMONC_COVERED_PCT_END -->
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="qc-right">
+          <h3>HemOnc exons with coverage &lt;20x</h3>
+          <div class="coverage-info scrollable-coverage">
+            <!-- HEMONC_COVERAGE_GAPS_START -->
+            <p class="no-data">No exons below 20x coverage.</p>
+            <!-- HEMONC_COVERAGE_GAPS_END -->
+          </div>
+          <p class="coverage-note print-only">⚠️ Showing first 10 entries only. View the HTML report for complete coverage data.</p>
+        </div>
+      </div>
+
+      <section class="coverage-section">
+        <h3>HemOnc genes overall coverage</h3>
+        <div class="coverage-grid">
+          <!-- HEMONC_COVERAGE_GRID_START -->
+          <!-- HEMONC_COVERAGE_GRID_END -->
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Page 7 - Methods & Limitations -->
+  <div class="page page-7">
     <header class="page-header">
       <h2>Methods & Limitations</h2>
     </header>

@@ -52,6 +52,7 @@ class TemplateProcessor:
         html_content = self._substitute_variant_tables(html_content, data)
         html_content = self._substitute_qc_metrics(html_content, data)
         html_content = self._substitute_coverage_data(html_content, data)
+        html_content = self._substitute_hemonc_section(html_content, data)
         html_content = self._substitute_methods_limitations(html_content, data)
 
         return html_content
@@ -185,28 +186,33 @@ class TemplateProcessor:
         """Replace coverage data for both sections on Page 3"""
 
         # Coverage gaps section
+        # NOTE: count=1 — the HemOnc page has its own identical fallback
+        # sentence, filled separately by _substitute_hemonc_section. Without
+        # this limit, ACMG gaps content would bleed into the HemOnc page.
         coverage_gaps = data.get('coverage_gaps', [])
         print(coverage_gaps)
         if coverage_gaps:
-            # Generate coverage gaps content
             gaps_html = self._generate_coverage_gaps_html(coverage_gaps)
-            # Replace the "No data available" message
             html = html.replace(
                 '<p class="no-data">No exons below 20x coverage.</p>',
-                gaps_html
+                gaps_html,
+                1,
             )
 
         # Overall coverage section
+        # NOTE: count=1 — same reason as above; the HemOnc page also has a
+        # <div class="coverage-grid">…</div> block, filled by
+        # _substitute_hemonc_section using its own marker regions.
         overall_coverage = data.get('overall_coverage', [])
         if overall_coverage:
             coverage_grid_html = self._generate_coverage_grid_html(overall_coverage)
-            # Replace the coverage grid content
             grid_pattern = r'(<div class="coverage-grid">.*?</div>)'
             html = re.sub(
                 grid_pattern,
                 f'<div class="coverage-grid">\n{coverage_grid_html}\n        </div>',
                 html,
-                flags=re.DOTALL
+                count=1,
+                flags=re.DOTALL,
             )
 
         return html
@@ -254,6 +260,70 @@ class TemplateProcessor:
             items.append(item_html)
 
         return '\n'.join(items)
+
+    # ---------------------------------------------------------------
+    # HemOnc pages (BioVarFlow_HemOnc branch)
+    # ---------------------------------------------------------------
+    def _substitute_hemonc_section(self, html: str, data: Dict[str, Any]) -> str:
+        """
+        Fill the four marker regions on the three HemOnc pages of the template:
+          - HEMONC_VARIANTS_HIGH_{START,END}   → variants with ClinVar ≥2 stars
+          - HEMONC_VARIANTS_LOW_{START,END}    → variants with ClinVar <2 stars / VUS
+          - HEMONC_COVERAGE_GAPS_{START,END}   → exons with %20x < 100
+          - HEMONC_COVERAGE_GRID_{START,END}   → per-gene overall coverage grid
+          - HEMONC_COVERED_PCT_{START,END}     → Sample Summary metric cell
+
+        Each marker's default content (a "no data" placeholder) is preserved
+        when the corresponding data list is empty, so ACMG-only runs render
+        cleanly.
+        """
+
+        def replace_between(html: str, start_marker: str, end_marker: str, replacement: str) -> str:
+            """Replace everything between two HTML-comment markers with `replacement`.
+            Markers themselves are preserved so the block can be re-substituted
+            during re-rendering / debugging."""
+            pattern = re.compile(
+                re.escape(f"<!-- {start_marker} -->") + r".*?" + re.escape(f"<!-- {end_marker} -->"),
+                flags=re.DOTALL,
+            )
+            wrapped = f"<!-- {start_marker} -->\n{replacement}\n              <!-- {end_marker} -->"
+            # Use a lambda so any backreference-like sequences in `wrapped`
+            # (e.g. \1, \g<...>) are treated literally, not as replacement
+            # references. Matters for URLs and gene symbols with backslashes.
+            return pattern.sub(lambda _m: wrapped, html, count=1)
+
+        # ---- High-confidence variant table ----
+        page1 = data.get('hemonc_page1_variants', [])
+        rows = self._generate_variant_rows(page1)
+        if not rows:
+            rows = '<tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
+        html = replace_between(html, 'HEMONC_VARIANTS_HIGH_START', 'HEMONC_VARIANTS_HIGH_END', rows)
+
+        # ---- Lower-confidence variant table ----
+        page2 = data.get('hemonc_page2_variants', [])
+        rows = self._generate_variant_rows(page2)
+        if not rows:
+            rows = '<tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
+        html = replace_between(html, 'HEMONC_VARIANTS_LOW_START', 'HEMONC_VARIANTS_LOW_END', rows)
+
+        # ---- Coverage gaps list ----
+        gaps = data.get('hemonc_coverage_gaps', [])
+        gaps_html = (self._generate_coverage_gaps_html(gaps)
+                     if gaps
+                     else '<p class="no-data">No exons below 20x coverage.</p>')
+        html = replace_between(html, 'HEMONC_COVERAGE_GAPS_START', 'HEMONC_COVERAGE_GAPS_END', gaps_html)
+
+        # ---- Overall coverage grid ----
+        grid = data.get('hemonc_overall_coverage', [])
+        grid_html = self._generate_coverage_grid_html(grid) if grid else ''
+        html = replace_between(html, 'HEMONC_COVERAGE_GRID_START', 'HEMONC_COVERAGE_GRID_END', grid_html)
+
+        # ---- HemOnc-scoped Sample Summary metric cell ----
+        pct = data.get('hemonc_covered_percent', '—')
+        cell_html = f'<td class="metric-value">{pct}</td>'
+        html = replace_between(html, 'HEMONC_COVERED_PCT_START', 'HEMONC_COVERED_PCT_END', cell_html)
+
+        return html
 
     def _substitute_methods_limitations(self, html: str, data: Dict[str, Any]) -> str:
         """Replace methods and limitations in the template"""

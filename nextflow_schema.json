@@ -29,7 +29,15 @@
           "type": "string",
           "title": "Run identifier",
           "description": "Identifier for this pipeline run. Written into the first column of ${outdir}/manifest/run_output_manifest.tsv. If omitted, Nextflow's auto-generated workflow.runName is used."
-        },
+        }
+      }
+    },
+
+    "_disabled_io_options": {
+      "title": "DISABLED on BioVarFlow_HemOnc branch",
+      "description": "These parameters are preserved verbatim for future re-enablement (somatic + BAM-input support). This block is intentionally NOT referenced from allOf, so the properties are not validated and do not appear in --help. To restore, move them back into io_options.properties and (if desired) delete this block.",
+      "type": "object",
+      "properties": {
         "input_bam": {
           "type": "string",
           "title": "BAM samplesheet (start from mapped data)",
