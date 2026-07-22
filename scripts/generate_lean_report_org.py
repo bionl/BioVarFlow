@@ -502,21 +502,37 @@ import re
 
 
 def _norm_revstat(s: str) -> str:
+    """
+    Decode VEP CSQ encoding of ClinVar review status text.
+
+    VEP writes CSQ subfields with `_` in place of spaces and `&` in place
+    of commas (because `,` is CSQ's transcript separator). So a raw
+    ClinVar status like "criteria provided, conflicting classifications"
+    arrives here as "criteria_provided&_conflicting_classifications".
+    """
     if not s: return ""
-    # Lowercase, replace underscores with spaces, collapse spaces/commas/semicolons
-    s = s.lower().replace("_", " ")
+    s = s.lower()
+    # Reverse VEP encoding: & -> "," and _ -> " "
+    s = s.replace("&", ",").replace("_", " ")
     s = re.sub(r"\s+", " ", s)
     return s
 
 def clinvar_stars_from_revstat(revstat: str) -> int:
     """
     Map ClinVar review status text to 0–4 stars (germline).
-    Handles multiple statuses separated by | , ; — returns the maximum.
+
+    Handles multiple statuses separated by | or ; — returns the maximum.
+    Commas are part of ClinVar status text (e.g. "criteria provided,
+    conflicting classifications") and MUST NOT be treated as a
+    separator; we normalize (decode VEP encoding) first so that any `&`
+    from VEP becomes a real `,` inside the status string, then split
+    only on genuine multi-status separators.
     """
     if not revstat: return None
-    toks = re.split(r"[|,;]+", revstat)
+    normalized = _norm_revstat(revstat)
+    toks = re.split(r"[|;]+", normalized)
     def map_one(t: str) -> int:
-        t = _norm_revstat(t).strip()
+        t = t.strip()
         if not t: return -1
         if t.startswith("practice guideline"): return 4
         if t.startswith("reviewed by expert panel"): return 3
@@ -555,7 +571,6 @@ def clinvar_url_from_row(r):
 
     # Else try ALLELEID
     alleleid = first_token(r.get("ALLELEID"))
-    print(alleleid)
     if alleleid:
         # keep only digits
         m = re.search(r"\d+", alleleid)
@@ -906,6 +921,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         variants["ClinVar_Link"] = variants["ClinVar_URL"].map(make_hyperlink)
         if "ClinVar" in variants.columns:
             variants = variants[variants["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)]
+            #variants = variants[variants["ClinVar_Stars"].fillna(0).astype(int) >= 2]
         else:
             variants = variants.iloc[0:0]
         if gene_set:

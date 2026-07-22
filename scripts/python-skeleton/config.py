@@ -90,7 +90,7 @@ ACMG_GENES = [
 
 # Pipeline Information
 PIPELINE_INFO = {
-    "default_pipeline": "BioVarFlow v1.1.0",
+    "default_pipeline": "BioVarFlow_HemOnc v1.1.0",
     "default_databases": "ClinVar (2025-01), gnomAD v4.1, Ensembl VEP Release 115, REVEL (latest release), AlphaMissense (Science 2023, updated 2025-05)"
 }
 
