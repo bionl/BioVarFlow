@@ -1001,6 +1001,14 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "Variant","Gene","HGVSc","HGVSp","MANE_ID","Transcript","Consequence","GT","Zygosity","AD_Ref","AD_Alt","DP","GQ","QUAL",
         "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full"
     ]
-    df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
+    df_pass = df[df["FILTER"]=="PASS"].copy()
+    df_pass[pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
+
+    # 6) PASS variants filtered to gnomAD AF < 1% (or absent from gnomAD)
+    #    and/or ClinVar Pathogenic/Likely pathogenic
+    af_numeric = df_pass["gnomAD_AF"].map(_num_or_none)
+    is_rare = af_numeric.isna() | (af_numeric < 0.01)
+    is_plp = df_pass["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)
+    df_pass[is_rare | is_plp][pass_cols].to_excel(xw, index=False, sheet_name="PASS Rare or P-LP")
 
 print(f"Wrote Excel report → {args.xlsx_out}")
