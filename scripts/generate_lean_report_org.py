@@ -549,6 +549,21 @@ def clinvar_stars_from_revstat(revstat: str) -> int:
 def clinvar_star_glyph(n):
     return "★"*int(n) if isinstance(n,(int,float)) and n>=0 else ""
 
+def is_pathogenic_clinvar(clinvar_val):
+    """
+    True only for an exact Pathogenic / Likely_pathogenic classification
+    (including combined "Pathogenic/Likely_pathogenic" or "Pathogenic&Likely_pathogenic").
+    Rejects substring-adjacent but distinct terms like
+    "Conflicting_classifications_of_pathogenicity" or "risk_factor".
+    """
+    if not clinvar_val:
+        return False
+    exact = {"pathogenic", "likely pathogenic"}
+    for tok in re.split(r"[&/|,]", str(clinvar_val)):
+        if tok.strip().lower().replace("_", " ") in exact:
+            return True
+    return False
+
 def clinvar_url_from_row(r):
     """
     Build a ClinVar URL for a variant row.
@@ -1008,7 +1023,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     #    and/or ClinVar Pathogenic/Likely pathogenic
     af_numeric = df_pass["gnomAD_AF"].map(_num_or_none)
     is_rare = af_numeric.isna() | (af_numeric < 0.01)
-    is_plp = df_pass["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)
+    is_plp = df_pass["ClinVar"].map(is_pathogenic_clinvar)
     df_pass[is_rare | is_plp][pass_cols].to_excel(xw, index=False, sheet_name="PASS Rare or P-LP")
 
 print(f"Wrote Excel report → {args.xlsx_out}")
