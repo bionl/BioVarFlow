@@ -22,6 +22,9 @@ include { DB_QC_EXPORT } \
 include { MANIFEST } \
   from './modules/manifest.nf'
 
+include { MUTECT2_RESCUE } \
+  from './modules/mutect2_rescue.nf'
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PARAMETERS & VALIDATION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -418,12 +421,16 @@ workflow RUN_FULL_VARIANT_CALLING {
 
         if (params.somatic_mode) {
             def isGCS = isGcsPath(params.outdir)
-            final_vcf_ch = NFCORE_SAREK.out.multiqc_report
+            def mutect2_vcf_ch = NFCORE_SAREK.out.multiqc_report
                 .flatMap {
                     file("${params.outdir}/variant_calling/mutect2/*/*.mutect2.filtered.vcf.gz", checkIfExists: !isGCS)
                 }
                 .filter { vcf -> vcf.name.endsWith('.vcf.gz') && !vcf.name.endsWith('.tbi') }
                 .map { vcf -> tuple(vcf.parent.name, vcf) }
+
+            def rescue_script_ch = Channel.value(file("${params.scriptdir}/mutect2_rescue.py"))
+            MUTECT2_RESCUE(mutect2_vcf_ch, rescue_script_ch)
+            final_vcf_ch = MUTECT2_RESCUE.out.map { sample, vcf, tbi -> tuple(sample, vcf) }
         } else if (params.create_consensus) {
             ref_fasta_ch = Channel.value(file(params.ref_fasta))
             ref_fai_ch   = Channel.value(file(params.ref_fasta + ".fai"))
