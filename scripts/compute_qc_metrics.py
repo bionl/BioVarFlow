@@ -187,21 +187,27 @@ def parse_mosdepth_global_dist(path):
     """Derive coverage threshold percentages from Sarek's mosdepth global.dist.txt.
 
     Each line: region\\tdepth\\tfraction_at_or_above.
-    We extract the ``total`` row at depths 10, 20, 30, 50.
+    Prefers ``total_region`` (present when --by BED is used, reflects panel coverage).
+    Falls back to ``total`` (genome-wide) when no BED was provided.
     """
-    dist = {}
+    region_dist = {}
+    total_dist = {}
     with open(path) as fh:
         for line in fh:
             cols = line.strip().split("\t")
-            if len(cols) < 3 or cols[0] != "total":
+            if len(cols) < 3:
                 continue
             try:
                 depth = int(cols[1])
                 frac = float(cols[2])
             except ValueError:
                 continue
-            dist[depth] = frac
+            if cols[0] == "total_region":
+                region_dist[depth] = frac
+            elif cols[0] == "total":
+                total_dist[depth] = frac
 
+    dist = region_dist if region_dist else total_dist
     return {
         t: round(dist.get(t, 0.0) * 100.0, 2)
         for t in (10, 20, 30, 50)
