@@ -23,7 +23,7 @@ process MUTECT2_RESCUE {
 
     script:
     """
-    python3 ${rescue_script} ${filtered_vcf} rescued.vcf
+    python ${rescue_script} ${filtered_vcf} rescued.vcf
 
     bgzip -c rescued.vcf > ${sample}.mutect2.filtered.rescued.vcf.gz
     tabix -p vcf ${sample}.mutect2.filtered.rescued.vcf.gz
