@@ -85,7 +85,7 @@ def process(in_path: str, out_path: str) -> None:
             filter_col = cols[6]
             info_col   = cols[7]
             fmt_col    = cols[8]
-            normal_col = cols[10]   # normal is the second sample
+            normal_col = cols[9]    # FORMAT order: [normal, tumor] — normal is col 9
 
             fmt_keys = fmt_col.split(":")
             info     = _info_dict(info_col)
