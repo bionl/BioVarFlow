@@ -232,6 +232,7 @@ class ExcelDataReader:
                 'gene': row.get('Gene', '—'),
                 'hgvsc': row.get('HGVSc', '—'),
                 'hgvsp': row.get('HGVSp', '—'),
+                'zygosity': row.get('Zygosity', '—'),
                 'clinvar_id': clinvar_id if clinvar_id else '',
             }
 
@@ -409,9 +410,10 @@ class ExcelDataReader:
                             clinvar_id = ''
 
                     variant_data = {
-                        'gene':  row.get('Gene', '—'),
-                        'hgvsc': row.get('HGVSc', '—'),
-                        'hgvsp': row.get('HGVSp', '—'),
+                        'gene':     row.get('Gene', '—'),
+                        'hgvsc':    row.get('HGVSc', '—'),
+                        'hgvsp':    row.get('HGVSp', '—'),
+                        'zygosity': row.get('Zygosity', '—'),
                         'clinvar_id': clinvar_id if clinvar_id else '',
                     }
 

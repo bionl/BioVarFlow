@@ -107,7 +107,7 @@ class TemplateProcessor:
             html = re.sub(page1_pattern, f'<tbody>\n{page1_html}\n</tbody>', html, flags=re.DOTALL)
         else:
             # No variants found
-            no_data_row = '<tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
+            no_data_row = '<tr><td colspan="4" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
             html = re.sub(page1_pattern, f'<tbody>\n{no_data_row}\n</tbody>', html, flags=re.DOTALL)
 
         # Page 2 variants (lower confidence)
@@ -120,7 +120,7 @@ class TemplateProcessor:
             html = re.sub(page2_pattern, f'<tbody>\n{page2_html}\n</tbody>', html, flags=re.DOTALL)
         else:
             # No variants found
-            no_data_row = '<tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
+            no_data_row = '<tr><td colspan="4" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
             html = re.sub(page2_pattern, f'<tbody>\n{no_data_row}\n</tbody>', html, flags=re.DOTALL)
 
         return html
@@ -135,6 +135,7 @@ class TemplateProcessor:
             gene = variant.get('gene', '—')
             hgvsc = variant.get('hgvsc', '—')
             hgvsp = variant.get('hgvsp', '—')
+            zygosity = variant.get('zygosity', '—')
             clinvar_id = variant.get('clinvar_id', '')
 
             for key in ['hgvsc', 'hgvsp']:
@@ -155,6 +156,7 @@ class TemplateProcessor:
           {gene_cell}
           <td class="font-mono text-sm">{hgvsc}</td>
           <td class="font-mono text-sm">{hgvsp}</td>
+          <td>{zygosity}</td>
         </tr>'''
 
             rows.append(row)
@@ -296,14 +298,14 @@ class TemplateProcessor:
         page1 = data.get('hemonc_page1_variants', [])
         rows = self._generate_variant_rows(page1)
         if not rows:
-            rows = '<tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
+            rows = '<tr><td colspan="4" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
         html = replace_between(html, 'HEMONC_VARIANTS_HIGH_START', 'HEMONC_VARIANTS_HIGH_END', rows)
 
         # ---- Lower-confidence variant table ----
         page2 = data.get('hemonc_page2_variants', [])
         rows = self._generate_variant_rows(page2)
         if not rows:
-            rows = '<tr><td colspan="3" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
+            rows = '<tr><td colspan="4" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
         html = replace_between(html, 'HEMONC_VARIANTS_LOW_START', 'HEMONC_VARIANTS_LOW_END', rows)
 
         # ---- Coverage gaps list ----
