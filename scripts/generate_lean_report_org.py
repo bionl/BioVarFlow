@@ -839,9 +839,10 @@ for var in vcf:
     if hgvsc:
         rec["HGVSc"] = hgvsc.split(":")[1] if ":" in hgvsc else hgvsc
     if hgvsp:
-        rec["HGVSp"] = hgvsp.split(":")[1] if ":" in hgvsp else hgvsp
+        raw = hgvsp.split(":")[1] if ":" in hgvsp else hgvsp
+        rec["HGVSp"] = raw.replace("%3D", "=")
     if gene or hgvsc or hgvsp:
-        rec["HGVS_full"] = f"{gene or ''} {hgvsc or ''} {hgvsp or ''}".strip()
+        rec["HGVS_full"] = f"{gene or ''} {hgvsc or ''} {(hgvsp or '').replace('%3D', '=')}".strip()
     records.append(rec)
 
 df = pd.DataFrame(records)

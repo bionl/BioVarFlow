@@ -105,6 +105,7 @@ class ACMGReportGenerator:
                 'gene': str(row.get('Gene', '—')),
                 'hgvsc': str(row.get('HGVSc', '—')),
                 'hgvsp': str(row.get('HGVSp', '—')),
+                'zygosity': str(row.get('Zygosity', '—')),
             }
             
             # Get star rating
@@ -164,14 +165,15 @@ class ACMGReportGenerator:
     def generate_variant_rows(self, variants):
         """Generate HTML table rows for variants"""
         if not variants:
-            return '              <tr><td colspan="3" class="text-center">No variants found</td></tr>'
-        
+            return '              <tr><td colspan="4" class="text-center">No variants found</td></tr>'
+
         rows = []
         for v in variants:
             row = f'''              <tr>
                 <td class="font-semibold">{v['gene']}</td>
                 <td class="font-mono text-sm">{v['hgvsc']}</td>
                 <td class="font-mono text-sm">{v['hgvsp']}</td>
+                <td>{v['zygosity']}</td>
               </tr>'''
             rows.append(row)
         
