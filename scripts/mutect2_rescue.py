@@ -3,11 +3,12 @@
 Post-hoc rescue of contamination-flagged somatic variants from FilterMutectCalls.
 
 A variant flagged as `contamination` is rescued (emitted as PASS) when ALL of:
-  TLOD  >= 10    strong somatic log-odds
-  POPAF >= 5.0   gnomAD AF < 1e-5
-  NLOD  >= 3.0   normal confidently ref
-  GERMQ >= 20    not germline (Phred)
+  TLOD      >= 6.0   strong somatic log-odds
+  POPAF     >= 5.0   gnomAD AF < 1e-5
+  NLOD      >= 3.0   normal confidently ref
+  GERMQ     >= 20    not germline (Phred)
   normal AD[1] == 0  zero alt reads in matched normal
+  tumor  AD[1] >= 5  at least 5 alt reads in tumor
 
 FORMAT columns are assumed ordered [tumor, normal].
 Multi-allelic TLOD/POPAF: only the first value is evaluated.
@@ -16,10 +17,11 @@ Multi-allelic TLOD/POPAF: only the first value is evaluated.
 import sys
 import gzip
 
-TLOD_MIN  = 10.0
-POPAF_MIN = 5.0
-NLOD_MIN  = 3.0
-GERMQ_MIN = 20.0
+TLOD_MIN   = 6.0
+POPAF_MIN  = 5.0
+NLOD_MIN   = 3.0
+GERMQ_MIN  = 20.0
+ALT_AD_MIN = 5
 
 
 def _first_float(value: str) -> float:
@@ -37,7 +39,7 @@ def _info_dict(info_field: str) -> dict:
     return d
 
 
-def _rescue(filters: str, info: dict, fmt_keys: list, normal_fmt: str) -> bool:
+def _rescue(filters: str, info: dict, fmt_keys: list, normal_fmt: str, tumor_fmt: str) -> bool:
     """Return True if this contamination-flagged variant should be rescued."""
     active = set(filters.split(";")) - {"PASS", "."}
     if "contamination" not in active:
@@ -54,6 +56,12 @@ def _rescue(filters: str, info: dict, fmt_keys: list, normal_fmt: str) -> bool:
         ad_idx   = fmt_keys.index("AD")
         ad_parts = fmt_vals[ad_idx].split(",")
         if int(ad_parts[1]) != 0:
+            return False
+
+        # Tumor sample AD[1] must be >= ALT_AD_MIN
+        tum_vals  = tumor_fmt.split(":")
+        tum_parts = tum_vals[ad_idx].split(",")
+        if int(tum_parts[1]) < ALT_AD_MIN:
             return False
 
     except (ValueError, IndexError, KeyError):
@@ -87,10 +95,12 @@ def process(in_path: str, out_path: str) -> None:
             fmt_col    = cols[8]
             normal_col = cols[9]    # FORMAT order: [normal, tumor] — normal is col 9
 
+            tumor_col  = cols[10]   # tumor is col 10
+
             fmt_keys = fmt_col.split(":")
             info     = _info_dict(info_col)
 
-            if _rescue(filter_col, info, fmt_keys, normal_col):
+            if _rescue(filter_col, info, fmt_keys, normal_col, tumor_col):
                 cols[6] = "PASS"
                 rescued += 1
 
