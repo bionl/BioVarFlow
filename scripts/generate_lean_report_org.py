@@ -405,22 +405,20 @@ def acmg_pct_regions_covered(th_path, min_depth=20, gene_set=None, key_prefix="A
     thr = pd.to_numeric(df[thr_col], errors="coerce")
     df = df.assign(_len=(e - s), _thr=thr).dropna(subset=["_len"]).copy()
 
-    # 6) Define "region id" to aggregate:
-    #    - If 'region' exists, treat each *label* as one region (matches mosdepth behavior when --by had names)
-    #    - Otherwise, use exact coordinates as the region id
-    if region_col and region_col in df.columns:
-        grp = df.groupby(region_col, as_index=False).agg(len_sum=("_len","sum"), thr_sum=("_thr","sum"))
-    else:
-        grp = (df.assign(_id = df[chrom].astype(str)+":"+
-                               s.astype("Int64").astype(str)+"-"+
-                               e.astype("Int64").astype(str))
-                 .groupby("_id", as_index=False).agg(len_sum=("_len","sum"), thr_sum=("_thr","sum")))
+    # 6) Each row is one exon interval — use coordinates as the region id so we
+    #    evaluate per-exon coverage instead of collapsing all exons of a gene.
+    #    (Grouping by gene name would require 100% of ALL gene bases to be ≥20x,
+    #    which almost nothing passes even at high mean coverage.)
+    grp = (df.assign(_id = df[chrom].astype(str)+":"+
+                           s.astype("Int64").astype(str)+"-"+
+                           e.astype("Int64").astype(str))
+             .groupby("_id", as_index=False).agg(len_sum=("_len","sum"), thr_sum=("_thr","sum")))
 
     total_regions = int(len(grp))
     if total_regions == 0:
         return out
 
-    # 7) A region is "fully covered" if all bases in that region have depth >= min_depth:
+    # 7) An exon interval is "covered" if all its bases have depth >= min_depth:
     covered = int((grp["thr_sum"] >= grp["len_sum"]).sum())
     pct = round(covered / total_regions * 100.0, 2)
 
