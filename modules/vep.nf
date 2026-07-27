@@ -2,7 +2,7 @@
 nextflow.enable.dsl=2
 
 // -------- Parameters (used by processes) --------
-params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMGG_SF_plus_KHCC_MANE_exones_50bp.bed"
+params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_plus_KHCC_MANE_exons_50bp.bed"
 params.sf_genes    = params.sf_genes    ?: "${workflow.projectDir}/data/acmg_sf_gene_list.txt"
 params.hemonc_genes= params.hemonc_genes?: "${workflow.projectDir}/data/hemonc.txt"
 params.outdir      = params.outdir      ?: "results"
