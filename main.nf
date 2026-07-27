@@ -29,7 +29,7 @@ include { MANIFEST } \
 // Default parameters
 params.input                  = params.input ?: params.samplesheet
 params.outdir                 = params.outdir ?: params.output
-params.bed                    = params.bed ?: "${workflow.projectDir}/data/annotated_merged_MANE_deduped_ALL.bed"
+params.bed                    = params.bed ?: "${workflow.projectDir}/data/ACMGG_SF_plus_KHCC_MANE_exones_50bp.bed"
 params.sf_genes               = params.sf_genes ?: "${workflow.projectDir}/data/acmg_sf_gene_list.txt"
 params.hemonc_genes           = params.hemonc_genes ?: "${workflow.projectDir}/data/hemonc.txt"
 //params.run_variant_calling    = params.run_variant_calling instanceof Boolean ? params.run_variant_calling : true
