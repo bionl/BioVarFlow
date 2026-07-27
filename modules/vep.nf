@@ -380,6 +380,7 @@ process VEP_Annotate {
     --fasta ${vep_fasta} \
     --assembly GRCh38 --species homo_sapiens \
     --hgvs --symbol --vcf --everything --canonical --merged \
+    --pick --pick_order mane_select,mane_plus_clinical,canonical,tsl,biotype,ccds,rank,length \
     --plugin REVEL,${revel_vcf} \
     --plugin AlphaMissense,file=${alpha_missense_vcf},cols=am_pathogenicity:am_class \
     --plugin SpliceAI,snv=${spliceai_snv_vcf},indel=${spliceai_indel_vcf} \
