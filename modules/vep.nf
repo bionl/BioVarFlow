@@ -400,13 +400,13 @@ process LeanReport {
           path(thresholds)
     each path(script)
   output:
-    tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants_lean.xlsx")
+    tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants.xlsx")
   script:
     def sample = meta.sample
   """
   mkdir -p ${sample}_report
   python ${script} \
-    $vcf $exon_cov $r1r2 $frstrand ${sample}_report/${sample}_variants_lean.xlsx \
+    $vcf $exon_cov $r1r2 $frstrand ${sample}_report/${sample}_variants.xlsx \
     --sample-id ${sample} --assay ${meta.assay} --build GRCh38 \
     --flagstat ${flagstat} --stats ${stats} \
     --mosdepth-summary ${mosdepth_summary} \
