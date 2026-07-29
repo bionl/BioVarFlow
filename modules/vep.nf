@@ -2,7 +2,7 @@
 nextflow.enable.dsl=2
 
 // -------- Parameters (used by processes) --------
-params.bed         = params.bed         ?: "${workflow.projectDir}/data/annotated_merged_MANE_deduped.bed"
+params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_MANE_exons_50bp.bed"
 params.outdir      = params.outdir      ?: "results"
 params.scriptdir   = params.scriptdir   ?: "${workflow.projectDir}/scripts"
 params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/template-files"
