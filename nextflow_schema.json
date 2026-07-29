@@ -42,6 +42,12 @@
           "title": "Somatic mode",
           "description": "Enable somatic variant calling using Mutect2 instead of DeepVariant/HaplotypeCaller. Supports tumor-only and tumor+normal pairs. VEP annotation is skipped in somatic mode.",
           "default": false
+        },
+        "genotype_germline_sites": {
+          "type": "boolean",
+          "title": "Genotype germline sites",
+          "description": "Pass --genotype-germline-sites to Mutect2. Use for tumor-only runs where germline secondary findings (ACMG SF) need to be extracted. Has no effect unless somatic_mode is also enabled.",
+          "default": false
         }
       }
     }
