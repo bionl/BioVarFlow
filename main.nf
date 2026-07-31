@@ -74,6 +74,62 @@ def validateBedFile() {
     return bedFile
 }
 
+// Reads the somatic samplesheet and injects a duplicate status=0 row (with a
+// _germline patient/sample suffix) for every tumor-only sample — i.e. any
+// patient that has a status=1 row but no matching status=0 row.  The two rows
+// share the same BAM/BAI path so Sarek runs HaplotypeCaller on the tumor BAM
+// as if it were a germline sample, without affecting Mutect2 pairing (Sarek
+// pairs by patient ID, and the injected row carries a distinct patient ID).
+def injectGermlineRows(String inputPath) {
+    def inputFile  = file(inputPath)
+    def lines      = inputFile.readLines()
+    def header     = lines[0]
+    def colNames   = header.split(',')*.trim()
+
+    def rows = lines.tail().findAll { it.trim() }.collect { line ->
+        def vals = line.split(',', -1)*.trim()
+        [colNames, vals].transpose().collectEntries { k, v -> [(k): v] }
+    }
+
+    // Identify patients that have only tumor rows (status=1, no status=0)
+    def patientStatuses = [:]
+    rows.each { row ->
+        def p = row['patient']
+        if (!patientStatuses.containsKey(p)) patientStatuses[p] = [] as Set
+        patientStatuses[p] << (row['status'] as Integer)
+    }
+    def tumorOnlyPatients = patientStatuses
+        .findAll { p, statuses -> 1 in statuses && !(0 in statuses) }
+        .keySet()
+
+    if (!tumorOnlyPatients) {
+        log.info "✓ No tumor-only samples found — samplesheet unchanged"
+        return inputPath
+    }
+
+    log.info "✓ Injecting germline rows for tumor-only patient(s): ${tumorOnlyPatients.join(', ')}"
+
+    def injected = []
+    rows.each { row ->
+        if (row['patient'] in tumorOnlyPatients && (row['status'] as Integer) == 1) {
+            def fake = new LinkedHashMap(row)
+            fake['patient'] = row['patient'] + '_germline'
+            fake['sample']  = row['sample']  + '_germline'
+            fake['status']  = '0'
+            injected << fake
+        }
+    }
+
+    def modifiedFile = file("${workflow.workDir}/samplesheet_somatic_with_germline.csv")
+    modifiedFile.text = header + '\n' +
+        (rows + injected)
+            .collect { row -> colNames.collect { row[it] ?: '' }.join(',') }
+            .join('\n') + '\n'
+
+    log.info "✓ Modified samplesheet written to: ${modifiedFile}"
+    return modifiedFile.toString()
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WORKFLOWS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -377,12 +433,18 @@ workflow RUN_FULL_VARIANT_CALLING {
         """.stripIndent()
         }
 
+        // In somatic mode, inject fake status=0 rows for tumor-only samples so
+        // Sarek runs HaplotypeCaller on them for ACMG SF reporting.
+        def samplesheetPath = (params.somatic_mode && params.input)
+            ? injectGermlineRows(params.input.toString())
+            : params.input
+
         PIPELINE_INITIALISATION(
             params.version,
             params.validate_params,
             args,
             params.outdir,
-            params.input,
+            samplesheetPath,
             params.help,
             params.help_full,
             params.show_hidden,
@@ -501,8 +563,47 @@ workflow RUN_FULL_VARIANT_CALLING {
             log.warn "params.run_db_qc=false → skipping run_output_manifest.tsv (QC Gate JSON is required to populate qc_status / qc_recommendation)."
         }
 
-        // POST_SAREK (VEP annotation) is germline-only — skip in somatic mode
-        if (!params.somatic_mode) {
+        // POST_SAREK for germline annotation:
+        // — germline mode: use consensus VCF as usual
+        // — somatic mode:  use HC VCFs from the injected _germline rows,
+        //   stripping the _germline suffix to recover the original sample name
+        if (params.somatic_mode) {
+            def isGCS = isGcsPath(params.outdir)
+
+            // HC filtered VCFs produced for _germline samples
+            def hc_germline_vcf_ch = NFCORE_SAREK.out.multiqc_report
+                .flatMap {
+                    file("${params.outdir}/variant_calling/haplotypecaller/*/*filtered.vcf.gz", checkIfExists: !isGCS)
+                }
+                .filter { vcf ->
+                    vcf.name.endsWith('.vcf.gz') &&
+                    !vcf.name.contains('.g.vcf.gz') &&
+                    !vcf.name.endsWith('.tbi') &&
+                    vcf.parent.name.endsWith('_germline')
+                }
+                .map { vcf ->
+                    // Strip _germline suffix to align with the original sample name
+                    def origSample = vcf.parent.name.replaceAll(/_germline$/, '')
+                    def meta = [ sample: origSample, assay: assayMap.get(origSample, 'NA') ]
+                    tuple(meta, vcf)
+                }
+
+            // BAMs for the _germline samples (same data as tumor, preprocessed separately)
+            def hc_germline_bam_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.bam
+                .filter { sample, bam, bai -> sample.endsWith('_germline') }
+                .map { sample, bam, bai ->
+                    def origSample = sample.replaceAll(/_germline$/, '')
+                    def meta = [ sample: origSample, assay: assayMap.get(origSample, 'NA') ]
+                    tuple(meta, bam, bai)
+                }
+
+            hc_germline_vcf_ch.ifEmpty {
+                log.warn "⚠️  No HC germline VCFs found — ACMG SF reporting skipped for somatic samples. " +
+                         "This is expected for paired tumor-normal runs (use the normal's HC VCF instead)."
+            }
+
+            POST_SAREK(hc_germline_vcf_ch, hc_germline_bam_ch, bed_ch)
+        } else {
             POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
         }
 }
