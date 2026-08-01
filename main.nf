@@ -121,6 +121,7 @@ def injectGermlineRows(String inputPath) {
     }
 
     def modifiedFile = file("${workflow.workDir}/samplesheet_somatic_with_germline.csv")
+    modifiedFile.parent.mkdirs()
     modifiedFile.text = header + '\n' +
         (rows + injected)
             .collect { row -> colNames.collect { row[it] ?: '' }.join(',') }
