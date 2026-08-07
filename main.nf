@@ -10,7 +10,7 @@ include { PIPELINE_INITIALISATION; PIPELINE_COMPLETION } \
 include { NFCORE_SAREK } \
   from './external/sarek/main.nf'
 
-include { POST_SAREK } \
+include { POST_SAREK; POST_SAREK_SOMATIC } \
   from './modules/vep.nf'
 
 include { CONSENSUS_CALLING } \
@@ -355,8 +355,8 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
                 log.info "✓ Found ${count} BAM file(s)"
             }
 
-        // Run post-processing
-        POST_SAREK(vcf_ch, bam_ch, bed_ch)
+        // Run post-processing (no somatic VCF in this path)
+        POST_SAREK(vcf_ch, bam_ch, bed_ch, Channel.empty())
 }
 
 workflow RUN_FROM_POST_SAMPLESHEET {
@@ -410,7 +410,7 @@ workflow RUN_FROM_POST_SAMPLESHEET {
         bam_ch.view { s, a, i -> "🧬 BAM -> ${s} :: ${a.name}" }
 
         // Run post-processing (no consensus for post-samplesheet)
-        POST_SAREK(vcf_ch, bam_ch, bed_ch)
+        POST_SAREK(vcf_ch, bam_ch, bed_ch, Channel.empty())
 }
 
 workflow RUN_FULL_VARIANT_CALLING {
@@ -571,7 +571,11 @@ workflow RUN_FULL_VARIANT_CALLING {
         if (params.somatic_mode) {
             def isGCS = isGcsPath(params.outdir)
 
-            // HC filtered VCFs produced for _germline samples
+            // ── Somatic VEP annotation (rescued Mutect2 VCF → somatic.vep.vcf) ──
+            POST_SAREK_SOMATIC(vcf_with_meta_ch)
+            def somatic_vep_ch = POST_SAREK_SOMATIC.out.somatic_vep
+
+            // HC filtered VCFs produced for _germline samples (ACMG SF)
             def hc_germline_vcf_ch = NFCORE_SAREK.out.multiqc_report
                 .flatMap {
                     file("${params.outdir}/variant_calling/haplotypecaller/*/*filtered.vcf.gz", checkIfExists: !isGCS)
@@ -603,9 +607,10 @@ workflow RUN_FULL_VARIANT_CALLING {
                          "This is expected for paired tumor-normal runs (use the normal's HC VCF instead)."
             }
 
-            POST_SAREK(hc_germline_vcf_ch, hc_germline_bam_ch, bed_ch)
+            // POST_SAREK: HC germline VCF for ACMG SF + somatic VEP for somatic tab
+            POST_SAREK(hc_germline_vcf_ch, hc_germline_bam_ch, bed_ch, somatic_vep_ch)
         } else {
-            POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
+            POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch, Channel.empty())
         }
 }
 

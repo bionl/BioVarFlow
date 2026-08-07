@@ -396,12 +396,14 @@ process LeanReport {
           path(mosdepth_summary),
           path(sex_check),
           path(gaps20), path(gaps30),
-          path(thresholds)
+          path(thresholds),
+          path(somatic_vcf)
     each path(script)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants_lean.xlsx")
   script:
-    def sample = meta.sample
+    def sample   = meta.sample
+    def som_arg  = somatic_vcf.name != 'NO_FILE' ? "--somatic-vcf ${somatic_vcf}" : ""
   """
   mkdir -p ${sample}_report
   python ${script} \
@@ -411,7 +413,82 @@ process LeanReport {
     --mosdepth-summary ${mosdepth_summary} \
     --acmg-thresholds ${thresholds} \
     --sexcheck ${sex_check} \
-    --gaps20 ${gaps20} --gaps30 ${gaps30}
+    --gaps20 ${gaps20} --gaps30 ${gaps30} \
+    ${som_arg}
+  """
+}
+
+// ── Somatic-specific VCF processing (no publishDir on intermediates) ──────────
+
+process NormalizeSomatic {
+  tag { "${meta.sample}" }
+  input:
+    tuple val(meta), path(vcf)
+  output:
+    tuple val(meta), path("${meta.sample}.somatic.norm.vcf.gz")
+  script:
+    def sample = meta.sample
+  """
+  bcftools norm -m -any $vcf -Oz -o ${sample}.somatic.norm.vcf.gz
+  tabix -p vcf ${sample}.somatic.norm.vcf.gz
+  """
+}
+
+process AddVAFSomatic {
+  tag { "${meta.sample}" }
+  input:
+    tuple val(meta), path(vcf)
+  output:
+    tuple val(meta), path("${meta.sample}.somatic.vaf.vcf.gz")
+  script:
+    def sample = meta.sample
+  """
+  bcftools +fill-tags $vcf -Oz -o ${sample}.somatic.vaf.vcf.gz -- -t FORMAT/VAF
+  tabix -p vcf ${sample}.somatic.vaf.vcf.gz
+  """
+}
+
+process VEP_Annotate_Somatic {
+  tag { "${meta.sample}" }
+  publishDir "${params.outdir}/${meta.sample}/somatic", mode: 'copy'
+  input:
+    tuple val(meta), path(vcf)
+    path vep_cache
+    path vep_fasta
+    path vep_fasta_fai
+    path revel_vcf
+    path revel_vcf_tbi
+    path alpha_missense_vcf
+    path alpha_missense_vcf_tbi
+    path clinvar_vcf
+    path clinvar_vcf_tbi
+    path spliceai_snv_vcf
+    path spliceai_snv_vcf_tbi
+    path spliceai_indel_vcf
+    path spliceai_indel_vcf_tbi
+    path bayesdel_vcf
+    path bayesdel_vcf_tbi
+    path vep_plugins
+  output:
+    tuple val(meta), path("${meta.sample}.somatic.vep.vcf")
+  script:
+    def sample = meta.sample
+  """
+  set -euo pipefail
+  if [[ "$vcf" == *.vcf.gz ]]; then gunzip -c "$vcf" > INPUT_FOR_VEP.vcf; else cp "$vcf" INPUT_FOR_VEP.vcf; fi
+  vep \
+    -i INPUT_FOR_VEP.vcf \
+    -o ${sample}.somatic.vep.vcf \
+    --offline --cache --dir_cache ${vep_cache} \
+    --dir_plugins ${vep_plugins} \
+    --fasta ${vep_fasta} \
+    --assembly GRCh38 --species homo_sapiens \
+    --hgvs --symbol --vcf --everything --canonical --merged \
+    --plugin REVEL,${revel_vcf} \
+    --plugin AlphaMissense,file=${alpha_missense_vcf},cols=am_pathogenicity:am_class \
+    --plugin SpliceAI,snv=${spliceai_snv_vcf},indel=${spliceai_indel_vcf} \
+    --plugin BayesDel,file=${bayesdel_vcf} \
+    --custom ${clinvar_vcf},ClinVar,vcf,exact,0,CLNSIG,CLNREVSTAT,ALLELEID
   """
 }
 
@@ -442,9 +519,10 @@ process GENERATE_ACMG_REPORT {
 
 workflow POST_SAREK {
   take:
-    vcf_ch   // (sample, vcf)
-    bam_ch//  // // (samp//le, bam, bai)
-    bed_ch   // value channel with //BED
+    vcf_ch          // tuple(meta, vcf)
+    bam_ch          // tuple(meta, bam, bai)
+    bed_ch          // value channel with BED
+    somatic_vcf_ch  // tuple(meta, somatic_vep_vcf) — pass Channel.empty() if not somatic mode
 
   main:
     // join per-sample → (s//ample, vcf, bam, bai)
@@ -498,7 +576,7 @@ workflow POST_SAREK {
     mosdepth_summary_ch = MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, summary) }
     thresholds_ch       = MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, thresholds) }
 
-    // join all for LeanReport
+    // join all for LeanReport (somatic_vcf_ch is optional — left-join with remainder)
     lean_input_ch = vep_ch
       .join(exon_cov_ch)
       .join(R1R2Ratio.out)
@@ -510,6 +588,49 @@ workflow POST_SAREK {
       .join(gaps20_ch)
       .join(gaps30_ch)
       .join(thresholds_ch)
+      .join(somatic_vcf_ch, remainder: true)
+      .map { meta, vcf, exon_cov, r1r2, frstrand, flagstat, stats, mosdepth_summary, sex_check, gaps20, gaps30, thresholds, somatic_vcf ->
+          def som = (somatic_vcf != null) ? somatic_vcf : file("${projectDir}/assets/NO_FILE")
+          tuple(meta, vcf, exon_cov, r1r2, frstrand, flagstat, stats, mosdepth_summary, sex_check, gaps20, gaps30, thresholds, som)
+      }
     LeanReport(lean_input_ch, script_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
+}
+
+// ── Somatic VEP annotation subworkflow ────────────────────────────────────────
+// Normalizes and VEP-annotates the rescued Mutect2 VCF.
+// Output published to ${outdir}/${sample}/somatic/${sample}.somatic.vep.vcf
+// Call POST_SAREK_SOMATIC in somatic mode before POST_SAREK; pass
+// POST_SAREK_SOMATIC.out.somatic_vep as the 4th arg to POST_SAREK.
+
+workflow POST_SAREK_SOMATIC {
+  take:
+    vcf_ch  // tuple(meta, rescued_vcf) — output of MUTECT2_RESCUE (with meta)
+
+  main:
+    NormalizeSomatic(vcf_ch)
+    AddVAFSomatic(NormalizeSomatic.out)
+
+    somatic_vep_ch = params.run_vep ? VEP_Annotate_Somatic(
+      AddVAFSomatic.out,
+      file(params.vep_cache),
+      file(params.vep_fasta),
+      file(params.vep_fasta + ".fai"),
+      file(params.revel_vcf),
+      file(params.revel_vcf + ".tbi"),
+      file(params.alpha_missense_vcf),
+      file(params.alpha_missense_vcf + ".tbi"),
+      file(params.clinvar_vcf),
+      file(params.clinvar_vcf + ".tbi"),
+      file(params.spliceai_snv_vcf),
+      file(params.spliceai_snv_vcf + ".tbi"),
+      file(params.spliceai_indel_vcf),
+      file(params.spliceai_indel_vcf + ".tbi"),
+      file(params.bayesdel_vcf),
+      file(params.bayesdel_vcf + ".tbi"),
+      file(params.vep_plugins)
+    ) : AddVAFSomatic.out
+
+  emit:
+    somatic_vep = somatic_vep_ch  // tuple(meta, somatic.vep.vcf)
 }

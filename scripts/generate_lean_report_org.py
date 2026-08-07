@@ -30,6 +30,8 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--somatic-vcf", default=None,
+               help="VEP-annotated rescued Mutect2 VCF — adds a Somatic Variants tab")
 
 
 
@@ -606,6 +608,149 @@ def parse_spliceai(val):
     return best_ds, best_event
 
 # -------------------------
+# Somatic VCF parser
+# -------------------------
+def parse_somatic_vcf(vcf_path):
+    """
+    Parse a VEP-annotated rescued Mutect2 VCF into a DataFrame.
+    Extracts somatic-specific fields (TLOD, POPAF, FORMAT/AF) alongside
+    the standard VEP annotation (Gene, Consequence, ClinVar, REVEL, etc.).
+    Returns an empty DataFrame if vcf_path is None or does not exist.
+    """
+    if not vcf_path or not os.path.exists(vcf_path):
+        return pd.DataFrame()
+
+    vcf_s = VCF(vcf_path)
+
+    # CSQ format from header
+    csq_fmt = []
+    for h in vcf_s.raw_header.split("\n"):
+        if h.startswith("##INFO=<ID=CSQ"):
+            try:
+                csq_fmt = h.split("Format: ")[1].rstrip('">').split("|")
+            except Exception:
+                pass
+            break
+
+    rows = []
+    for var in vcf_s:
+        chrom = var.CHROM
+        pos   = var.POS
+        ref   = var.REF
+        alt   = ",".join(var.ALT) if var.ALT else ""
+
+        # Somatic INFO fields
+        tlod = popaf = None
+        try:
+            raw = var.INFO.get("TLOD")
+            if raw is not None:
+                tlod = round(float(str(raw).split(",")[0]), 2)
+        except Exception:
+            pass
+        try:
+            raw = var.INFO.get("POPAF")
+            if raw is not None:
+                popaf = round(float(str(raw).split(",")[0]), 2)
+        except Exception:
+            pass
+
+        # FORMAT fields — Mutect2 uses AF (not VAF)
+        af = dp = ad_ref = ad_alt = None
+        try:
+            arr = var.format("AF")
+            if arr is not None:
+                af = round(float(arr[0][0]), 4)
+        except Exception:
+            pass
+        try:
+            arr = var.format("DP")
+            if arr is not None:
+                dp = int(arr[0][0])
+        except Exception:
+            pass
+        try:
+            arr = var.format("AD")
+            if arr is not None:
+                ad_ref, ad_alt = int(arr[0][0]), int(arr[0][1])
+        except Exception:
+            pass
+
+        # VEP CSQ
+        gene = transcript = hgvsc = hgvsp = consequence = impact = None
+        clinvar = alleleid = revel = am_pathogenicity = am_class = gnomad_af = None
+        spliceai_ds = spliceai_event = bayesdel_score = clinvar_review_status = None
+
+        if csq_fmt:
+            ann = select_csq_entry(var, csq_fmt) or {}
+            gene          = ann.get("SYMBOL")
+            transcript    = ann.get("Feature")
+            hgvsc         = ann.get("HGVSc")
+            hgvsp         = ann.get("HGVSp")
+            consequence   = ann.get("Consequence")
+            impact        = ann.get("IMPACT")
+            gnomad_af     = ann.get("gnomADg_AF") or ann.get("gnomADe_AF") or ann.get("AF")
+            revel         = ann.get("REVEL")
+            am_pathogenicity = ann.get("am_pathogenicity")
+            am_class      = ann.get("am_class")
+            clinvar       = ann.get("ClinVar_CLNSIG") or ann.get("CLIN_SIG")
+            alleleid      = ann.get("ClinVar")
+            clinvar_review_status = ann.get("ClinVar_CLNREVSTAT") or ann.get("CLNREVSTAT")
+            bayesdel_score = ann.get("BayesDel")
+            spliceai_fields = {
+                "DS_AG": ann.get("SpliceAI_pred_DS_AG"),
+                "DS_AL": ann.get("SpliceAI_pred_DS_AL"),
+                "DS_DG": ann.get("SpliceAI_pred_DS_DG"),
+                "DS_DL": ann.get("SpliceAI_pred_DS_DL"),
+            }
+            scores = {k: float(v) for k, v in spliceai_fields.items()
+                      if v not in [None, ""]}
+            if scores:
+                spliceai_event, spliceai_ds = max(scores.items(), key=lambda kv: kv[1])
+
+        if hgvsc and ":" in hgvsc:
+            hgvsc = hgvsc.split(":")[1]
+        if hgvsp and ":" in hgvsp:
+            hgvsp = hgvsp.split(":")[1]
+
+        stars  = clinvar_stars_from_revstat(clinvar_review_status or "")
+        revstat = clinvar_review_status or ""
+
+        rows.append({
+            "Gene":                gene,
+            "Variant":             f"{chrom}:{pos}:{ref}:{alt}",
+            "Chrom":               chrom,
+            "Pos":                 pos,
+            "Ref":                 ref,
+            "Alt":                 alt,
+            "Consequence":         consequence,
+            "Impact":              impact,
+            "HGVSc":               hgvsc,
+            "HGVSp":               hgvsp,
+            "Transcript":          transcript,
+            "VAF":                 af,
+            "AD_Ref":              ad_ref,
+            "AD_Alt":              ad_alt,
+            "DP":                  dp,
+            "TLOD":                tlod,
+            "POPAF":               popaf,
+            "gnomAD_AF":           gnomad_af,
+            "ClinVar":             clinvar,
+            "ClinVar_ReviewStatus": revstat,
+            "ClinVar_Stars":       stars,
+            "ClinVar_StarsGlyph":  clinvar_star_glyph(stars),
+            "ALLELEID":            alleleid,
+            "REVEL":               revel,
+            "SpliceAI_DS_max":     spliceai_ds,
+            "SpliceAI_Event":      spliceai_event,
+            "BayesDel_score":      bayesdel_score,
+            "AM_Pathogenicity":    am_pathogenicity,
+            "AM_Class":            am_class,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# -------------------------
 # Coverage summary loader (your format)
 # -------------------------
 coverage_data = {}
@@ -886,11 +1031,33 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
 
     genes_cov.to_excel(xw, index=False, sheet_name="ACMG SF Genes Coverage")
 
-    # 5) PASS variant table
+    # 5) PASS variant table (germline HC)
     pass_cols = [
         "Variant","Gene","HGVSc","HGVSp","MANE_ID","Transcript","Consequence","GT","Zygosity","AD_Ref","AD_Alt","DP","GQ","QUAL",
         "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full"
     ]
     df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
+
+    # 6) Somatic Variants (rescued Mutect2 VCF, VEP-annotated)
+    som_df = parse_somatic_vcf(args.somatic_vcf)
+    if not som_df.empty:
+        som_cols = [
+            "Gene", "Variant", "HGVSc", "HGVSp", "Transcript",
+            "Consequence", "Impact",
+            "VAF", "AD_Ref", "AD_Alt", "DP",
+            "TLOD", "POPAF",
+            "gnomAD_AF",
+            "ClinVar", "ClinVar_ReviewStatus", "ClinVar_Stars", "ClinVar_StarsGlyph",
+            "REVEL", "SpliceAI_DS_max", "SpliceAI_Event",
+            "BayesDel_score", "AM_Pathogenicity", "AM_Class",
+        ]
+        # keep only columns that are present (future-proof)
+        som_cols = [c for c in som_cols if c in som_df.columns]
+        som_df[som_cols].to_excel(xw, index=False, sheet_name="Somatic Variants")
+    else:
+        # write an empty placeholder so the tab always exists when the pipeline runs
+        pd.DataFrame(columns=["Gene","Variant","Consequence","VAF","AD_Alt","DP","TLOD","ClinVar"]).to_excel(
+            xw, index=False, sheet_name="Somatic Variants"
+        )
 
 print(f"Wrote Excel report → {args.xlsx_out}")
