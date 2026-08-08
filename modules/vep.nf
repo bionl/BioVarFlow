@@ -18,7 +18,6 @@ params.min_qual = params.min_qual ?: 10
 
 process BedFilterVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
   input:
     tuple val(meta), path(vcf)
     path bed
@@ -35,7 +34,6 @@ process BedFilterVCF {
 
 process NormalizeVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
   input:
     tuple val(meta), path(vcf)
   output:
@@ -50,7 +48,6 @@ process NormalizeVCF {
 
 process FilterVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
   input:
     tuple val(meta), path(vcf)
   output:
@@ -64,8 +61,7 @@ process FilterVCF {
 }
 
 process AddVAF {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
+  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
   input:
     tuple val(meta), path(vcf)
   output:
@@ -80,7 +76,6 @@ process AddVAF {
 
 process BedFilterBAM {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
   input:
     tuple val(meta), path(vcf), path(bam)
     path bed
@@ -97,12 +92,12 @@ process BedFilterBAM {
 
 process CoverageSummary {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
+  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy', pattern: "*_coverage_summary.sorted.txt"
   input:
     tuple val(meta), path(bam)
     path bed
   output:
-    tuple val(meta), path("${meta.sample}_coverage_summary.sorted.txt"), path("${meta.sample}_coverage_per_base.txt")
+    tuple val(meta), path("${meta.sample}_coverage_summary.sorted.txt")
   script:
     def sample = meta.sample
   """
@@ -119,8 +114,7 @@ process CoverageSummary {
 }
 
 process R1R2Ratio {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay   
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
+  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
   input:
     tuple val(meta), path(bam), path(bai)
     path bed
@@ -139,8 +133,7 @@ process R1R2Ratio {
 }
 
 process ForwardReverseRatio {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
+  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
   input:
     tuple val(meta), path(bam), path(bai)
     path bed
@@ -233,8 +226,6 @@ process CoverageGapsAnnotation {
 
   output:
     tuple val(meta),
-      path("${meta.sample}.acmg_gaps_lt20.bed"),
-      path("${meta.sample}.acmg_gaps_lt30.bed"),
       path("${meta.sample}.acmg_gaps_lt20.annot.bed"),
       path("${meta.sample}.acmg_gaps_lt30.annot.bed")
 
@@ -570,9 +561,9 @@ workflow POST_SAREK {
     BcftoolsStats(vep_ch.map { s, vcf -> tuple(s, vcf) })
 
     // prepare joins keyed by sample
-    exon_cov_ch         = CoverageSummary.out.map { s, summary, per_base -> tuple(s, summary) }
-    gaps20_ch           = CoverageGapsAnnotation.out.map { s, g20, g30, a20, a30 -> tuple(s, a20) }
-    gaps30_ch           = CoverageGapsAnnotation.out.map { s, g20, g30, a20, a30 -> tuple(s, a30) }
+    exon_cov_ch         = CoverageSummary.out.map { s, summary -> tuple(s, summary) }
+    gaps20_ch           = CoverageGapsAnnotation.out.map { s, a20, a30 -> tuple(s, a20) }
+    gaps30_ch           = CoverageGapsAnnotation.out.map { s, a20, a30 -> tuple(s, a30) }
     mosdepth_summary_ch = MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, summary) }
     thresholds_ch       = MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, thresholds) }
 
