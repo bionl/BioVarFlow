@@ -131,6 +131,55 @@ def injectGermlineRows(String inputPath) {
     return modifiedFile.toString()
 }
 
+// Reads the somatic samplesheet and builds a map from normal sample name →
+// tumor sample name for every paired patient (a patient that has both a
+// status=0 and a status=1 row).  Used to remap HC VCFs produced for the real
+// normal into the tumor sample namespace so they can be joined with the
+// somatic VEP channel (which is keyed by tumor name) for combined reporting.
+//
+// Example: PatientA / NormalA (status=0) + PatientA / TumorA (status=1)
+//          → [ "NormalA": "TumorA" ]
+def buildNormalToTumorMap(String inputPath) {
+    def inputFile = file(inputPath)
+    def lines     = inputFile.readLines()
+    def header    = lines[0]
+    def colNames  = header.split(',')*.trim()
+
+    def rows = lines.tail().findAll { it.trim() }.collect { line ->
+        def vals = line.split(',', -1)*.trim()
+        [colNames, vals].transpose().collectEntries { k, v -> [(k): v] }
+    }
+
+    // Group by patient → collect normal and tumor sample names
+    def byPatient = [:]
+    rows.each { row ->
+        def p = row['patient']
+        if (!byPatient.containsKey(p)) byPatient[p] = [ normals: [], tumors: [] ]
+        if ((row['status'] as Integer) == 0) byPatient[p].normals << row['sample']
+        if ((row['status'] as Integer) == 1) byPatient[p].tumors  << row['sample']
+    }
+
+    // Only keep patients that have BOTH a normal and a tumor (paired case)
+    def normalToTumor = [:]
+    byPatient.each { patient, samples ->
+        if (samples.normals && samples.tumors) {
+            // For each normal, map it to its paired tumor(s).
+            // In the common 1-normal : 1-tumor case this is a simple 1:1 map.
+            samples.normals.each { normal ->
+                // Map to the first tumor; extend if multi-tumor per normal is needed.
+                normalToTumor[normal] = samples.tumors[0]
+            }
+            log.info "✓ Paired patient ${patient}: normal(s) ${samples.normals} → tumor(s) ${samples.tumors}"
+        }
+    }
+
+    if (!normalToTumor) {
+        log.info "✓ No paired tumor-normal patients found — normalToTumorMap is empty"
+    }
+
+    return normalToTumor
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WORKFLOWS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -565,36 +614,59 @@ workflow RUN_FULL_VARIANT_CALLING {
         }
 
         // POST_SAREK for germline annotation:
-        // — germline mode: use consensus VCF as usual
-        // — somatic mode:  use HC VCFs from the injected _germline rows,
-        //   stripping the _germline suffix to recover the original sample name
+        // — germline mode:      consensus VCF as usual
+        // — somatic tumor-only: HC VCF from injected _germline rows, suffix stripped
+        // — somatic paired:     HC VCF from real normal, remapped to tumor name via normalToTumorMap
         if (params.somatic_mode) {
             def isGCS = isGcsPath(params.outdir)
+
+            // Build normal→tumor map for paired patients (empty map if all tumor-only)
+            def samplesheetForMap = params.input?.toString() ?: ''
+            def normalToTumorMap  = samplesheetForMap ? buildNormalToTumorMap(samplesheetForMap) : [:]
 
             // ── Somatic VEP annotation (rescued Mutect2 VCF → somatic.vep.vcf) ──
             POST_SAREK_SOMATIC(vcf_with_meta_ch)
             def somatic_vep_ch = POST_SAREK_SOMATIC.out.somatic_vep
 
-            // HC filtered VCFs produced for _germline samples (ACMG SF)
-            def hc_germline_vcf_ch = NFCORE_SAREK.out.multiqc_report
+            // ── HC VCF collection — all filtered VCFs from haplotypecaller output ──
+            def all_hc_vcf_ch = NFCORE_SAREK.out.multiqc_report
                 .flatMap {
                     file("${params.outdir}/variant_calling/haplotypecaller/*/*filtered.vcf.gz", checkIfExists: !isGCS)
                 }
                 .filter { vcf ->
                     vcf.name.endsWith('.vcf.gz') &&
                     !vcf.name.contains('.g.vcf.gz') &&
-                    !vcf.name.endsWith('.tbi') &&
-                    vcf.parent.name.endsWith('_germline')
+                    !vcf.name.endsWith('.tbi')
                 }
+
+            // ── Tumor-only: dirs ending in _germline → strip suffix to get tumor name ──
+            def tumor_only_vcf_ch = all_hc_vcf_ch
+                .filter { vcf -> vcf.parent.name.endsWith('_germline') }
                 .map { vcf ->
-                    // Strip _germline suffix to align with the original sample name
                     def origSample = vcf.parent.name.replaceAll(/_germline$/, '')
                     def meta = [ sample: origSample, assay: assayMap.get(origSample, 'NA') ]
                     tuple(meta, vcf)
                 }
 
-            // BAMs for the _germline samples (same data as tumor, preprocessed separately)
-            def hc_germline_bam_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.bam
+            // ── Paired: real normal dirs → remap NormalA → TumorA via normalToTumorMap ──
+            def paired_vcf_ch = all_hc_vcf_ch
+                .filter { vcf ->
+                    !vcf.parent.name.endsWith('_germline') &&
+                    normalToTumorMap.containsKey(vcf.parent.name)
+                }
+                .map { vcf ->
+                    def tumorSample = normalToTumorMap[vcf.parent.name]
+                    def meta = [ sample: tumorSample, assay: assayMap.get(tumorSample, 'NA') ]
+                    tuple(meta, vcf)
+                }
+
+            // Merge both branches — each item is already keyed by tumor sample name
+            def hc_germline_vcf_ch = tumor_only_vcf_ch.mix(paired_vcf_ch)
+
+            // ── BAM collection — same two-branch logic ──
+            def all_bam_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.bam
+
+            def tumor_only_bam_ch = all_bam_ch
                 .filter { sample, bam, bai -> sample.endsWith('_germline') }
                 .map { sample, bam, bai ->
                     def origSample = sample.replaceAll(/_germline$/, '')
@@ -602,12 +674,24 @@ workflow RUN_FULL_VARIANT_CALLING {
                     tuple(meta, bam, bai)
                 }
 
+            def paired_bam_ch = all_bam_ch
+                .filter { sample, bam, bai ->
+                    !sample.endsWith('_germline') &&
+                    normalToTumorMap.containsKey(sample)
+                }
+                .map { sample, bam, bai ->
+                    def tumorSample = normalToTumorMap[sample]
+                    def meta = [ sample: tumorSample, assay: assayMap.get(tumorSample, 'NA') ]
+                    tuple(meta, bam, bai)
+                }
+
+            def hc_germline_bam_ch = tumor_only_bam_ch.mix(paired_bam_ch)
+
             hc_germline_vcf_ch.ifEmpty {
-                log.warn "⚠️  No HC germline VCFs found — ACMG SF reporting skipped for somatic samples. " +
-                         "This is expected for paired tumor-normal runs (use the normal's HC VCF instead)."
+                log.warn "⚠️  No HC germline VCFs found — ACMG SF reporting skipped for all somatic samples."
             }
 
-            // POST_SAREK: HC germline VCF for ACMG SF + somatic VEP for somatic tab
+            // POST_SAREK: HC germline VCF (ACMG SF) + somatic VEP — both keyed by tumor name
             POST_SAREK(hc_germline_vcf_ch, hc_germline_bam_ch, bed_ch, somatic_vep_ch)
         } else {
             POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch, Channel.empty())
