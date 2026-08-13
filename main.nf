@@ -538,7 +538,12 @@ workflow RUN_FULL_VARIANT_CALLING {
                     file("${params.outdir}/variant_calling/mutect2/*/*.mutect2.filtered.vcf.gz", checkIfExists: !isGCS)
                 }
                 .filter { vcf -> vcf.name.endsWith('.vcf.gz') && !vcf.name.endsWith('.tbi') }
-                .map { vcf -> tuple(vcf.parent.name, vcf) }
+                .map { vcf ->
+                    // Sarek names paired dirs as TumorA_vs_NormalA — strip _vs_* to get
+                    // the tumor sample name so publishDir and downstream joins use it.
+                    def sampleName = vcf.parent.name.replaceAll(/_vs_.+$/, '')
+                    tuple(sampleName, vcf)
+                }
 
             def rescue_script_ch = Channel.value(file("${params.scriptdir}/mutect2_rescue.py"))
             MUTECT2_RESCUE(mutect2_vcf_ch, rescue_script_ch)
