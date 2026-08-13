@@ -420,7 +420,10 @@ process NormalizeSomatic {
   script:
     def sample = meta.sample
   """
-  bcftools norm -m -any $vcf -Oz -o ${sample}.somatic.norm.vcf.gz
+  # Keep only PASS variants (rescued contamination + original PASSes)
+  # then split multi-allelics and left-normalise
+  bcftools view -f PASS $vcf \
+    | bcftools norm -m -any -Oz -o ${sample}.somatic.norm.vcf.gz
   tabix -p vcf ${sample}.somatic.norm.vcf.gz
   """
 }
