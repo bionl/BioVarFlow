@@ -419,10 +419,20 @@ process NormalizeSomatic {
     tuple val(meta), path("${meta.sample}.somatic.norm.vcf.gz")
   script:
     def sample = meta.sample
+    // Tumor-only samples have no matched normal, so FilterMutectCalls cannot use
+    // NLOD / normal_artifact to suppress germline and artefact calls. Apply three
+    // post-hoc exclusion filters to tighten the PASS set:
+    //   1. INFO/POPAF   >= 3.0  — remove common germline (gnomAD AF > 0.001)
+    //   2. FORMAT/AF    >= 0.05 — drop the 0–5% VAF bin (high FP rate without normal)
+    //   3. FORMAT/AD[1] >= 5    — require at least 5 alt-supporting reads
+    // Paired samples skip these: MUTECT2_RESCUE already promoted valid
+    // contamination-tagged variants back, and NLOD suppression did its job.
+    def tumorOnlyFilter = (meta.somatic_type == 'tumor_only')
+        ? "| bcftools filter -i 'INFO/POPAF >= 3.0 && FORMAT/AF >= 0.05 && FORMAT/AD[1] >= 5' "
+        : ""
   """
-  # Keep only PASS variants (rescued contamination + original PASSes)
-  # then split multi-allelics and left-normalise
-  bcftools view -f PASS $vcf \
+  bcftools view -f PASS $vcf \\
+    ${tumorOnlyFilter}\\
     | bcftools norm -m -any -Oz -o ${sample}.somatic.norm.vcf.gz
   tabix -p vcf ${sample}.somatic.norm.vcf.gz
   """

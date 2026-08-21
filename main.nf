@@ -533,11 +533,36 @@ workflow RUN_FULL_VARIANT_CALLING {
 
         if (params.somatic_mode) {
             def isGCS = isGcsPath(params.outdir)
+
+            // Build normal→tumor map early — needed to pick the right Mutect2 VCF.
+            // When a patient has a paired run, Sarek emits TWO mutect2 dirs:
+            //   mutect2/HCC1395T/         ← tumor-only run (wrong for paired patients)
+            //   mutect2/HCC1395T_vs_HCC1395N/ ← paired run (correct for paired patients)
+            // Stripping _vs_* from both yields the same key "HCC1395T", causing a
+            // duplicate channel entry. We must pick only the paired dir for paired
+            // patients and only the non-_vs_ dir for tumor-only patients.
+            def samplesheetForMap0 = params.input?.toString() ?: ''
+            def normalToTumorMap0  = samplesheetForMap0 ? buildNormalToTumorMap(samplesheetForMap0) : [:]
+            // Collect all tumor sample names that have a paired normal
+            def pairedTumors = normalToTumorMap0.values().toSet()
+
             def mutect2_vcf_ch = NFCORE_SAREK.out.multiqc_report
                 .flatMap {
                     file("${params.outdir}/variant_calling/mutect2/*/*.mutect2.filtered.vcf.gz", checkIfExists: !isGCS)
                 }
                 .filter { vcf -> vcf.name.endsWith('.vcf.gz') && !vcf.name.endsWith('.tbi') }
+                .filter { vcf ->
+                    def dirName = vcf.parent.name
+                    def isPaired = dirName.contains('_vs_')
+                    // For paired patients: only keep the _vs_ dir (paired Mutect2 output).
+                    // For tumor-only patients: only keep the non-_vs_ dir.
+                    if (isPaired) {
+                        def tumorName = dirName.replaceAll(/_vs_.+$/, '')
+                        return pairedTumors.contains(tumorName)
+                    } else {
+                        return !pairedTumors.contains(dirName)
+                    }
+                }
                 .map { vcf ->
                     // Sarek names paired dirs as TumorA_vs_NormalA — strip _vs_* to get
                     // the tumor sample name so publishDir and downstream joins use it.
@@ -630,8 +655,23 @@ workflow RUN_FULL_VARIANT_CALLING {
             def normalToTumorMap  = samplesheetForMap ? buildNormalToTumorMap(samplesheetForMap) : [:]
 
             // ── Somatic VEP annotation (rescued Mutect2 VCF → somatic.vep.vcf) ──
-            POST_SAREK_SOMATIC(vcf_with_meta_ch)
+            // Tag each rescued VCF with somatic_type so NormalizeSomatic applies the
+            // right post-hoc filters:
+            //   paired     → PASS only (rescue already promoted valid variants back)
+            //   tumor_only → PASS + POPAF/VAF/alt-read filters to cut the FP rate
+            def somatic_input_ch = vcf_with_meta_ch.map { meta, vcf ->
+                def somType = normalToTumorMap.values().toSet().contains(meta.sample) ? 'paired' : 'tumor_only'
+                tuple(meta + [somatic_type: somType], vcf)
+            }
+
+            POST_SAREK_SOMATIC(somatic_input_ch)
+
+            // Strip somatic_type back out so the meta key matches the HC germline
+            // channel ([sample, assay]) for the join inside POST_SAREK.
             def somatic_vep_ch = POST_SAREK_SOMATIC.out.somatic_vep
+                .map { meta, vcf ->
+                    tuple([ sample: meta.sample, assay: meta.assay ], vcf)
+                }
 
             // ── HC VCF collection — all filtered VCFs from haplotypecaller output ──
             def all_hc_vcf_ch = NFCORE_SAREK.out.multiqc_report
