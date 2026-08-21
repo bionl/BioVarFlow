@@ -424,16 +424,21 @@ process NormalizeSomatic {
     // post-hoc exclusion filters to tighten the PASS set:
     //   1. INFO/POPAF   >= 3.0  — remove common germline (gnomAD AF > 0.001)
     //   2. FORMAT/AF    >= 0.05 — drop the 0–5% VAF bin (high FP rate without normal)
-    //   3. FORMAT/AD[1] >= 5    — require at least 5 alt-supporting reads
+    //   3. FORMAT/AD[0:1] >= 5  — require at least 5 alt-supporting reads
+    //      (bcftools needs AD[sample:subfield]; tumor-only VCFs have one sample)
     // Paired samples skip these: MUTECT2_RESCUE already promoted valid
     // contamination-tagged variants back, and NLOD suppression did its job.
+    //
+    // The filter runs AFTER `norm -m -any` so every record is single-ALT and the
+    // [0:0]/[0:1] subfield indices refer unambiguously to that one alt allele.
     def tumorOnlyFilter = (meta.somatic_type == 'tumor_only')
-        ? "| bcftools filter -i 'INFO/POPAF >= 3.0 && FORMAT/AF >= 0.05 && FORMAT/AD[1] >= 5' "
+        ? "| bcftools filter -i 'INFO/POPAF >= 3.0 && FORMAT/AF[0:0] >= 0.05 && FORMAT/AD[0:1] >= 5' "
         : ""
   """
   bcftools view -f PASS $vcf \\
+    | bcftools norm -m -any \\
     ${tumorOnlyFilter}\\
-    | bcftools norm -m -any -Oz -o ${sample}.somatic.norm.vcf.gz
+    -Oz -o ${sample}.somatic.norm.vcf.gz
   tabix -p vcf ${sample}.somatic.norm.vcf.gz
   """
 }
