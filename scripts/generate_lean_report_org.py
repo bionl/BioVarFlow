@@ -353,7 +353,6 @@ def acmg_pct_regions_covered(th_path, min_depth=20):
     chrom = pick_exact({"chrom", "chr"}, cols[0] if cols else None)
     start = pick_exact({"start"}, cols[1] if len(cols) > 1 else None)
     end   = pick_exact({"end"},   cols[2] if len(cols) > 2 else None)
-    region_col = pick_exact({"region", "target", "name"}, None)  # mosdepth uses 'region' when --by had a 4th column
 
     if chrom is None or start is None or end is None:
         return out
@@ -378,16 +377,16 @@ def acmg_pct_regions_covered(th_path, min_depth=20):
     thr = pd.to_numeric(df[thr_col], errors="coerce")
     df = df.assign(_len=(e - s), _thr=thr).dropna(subset=["_len"]).copy()
 
-    # 6) Define "region id" to aggregate:
-    #    - If 'region' exists, treat each *label* as one region (matches mosdepth behavior when --by had names)
-    #    - Otherwise, use exact coordinates as the region id
-    if region_col and region_col in df.columns:
-        grp = df.groupby(region_col, as_index=False).agg(len_sum=("_len","sum"), thr_sum=("_thr","sum"))
-    else:
-        grp = (df.assign(_id = df[chrom].astype(str)+":"+
-                               s.astype("Int64").astype(str)+"-"+
-                               e.astype("Int64").astype(str))
-                 .groupby("_id", as_index=False).agg(len_sum=("_len","sum"), thr_sum=("_thr","sum")))
+    # 6) Each row is one exon interval — use coordinates as the region id so we
+    #    evaluate per-exon coverage instead of collapsing all exons of a gene.
+    #    (Grouping by the BED's 4th-column label would collapse them: the labels
+    #    are GENE|TRANSCRIPT and repeat across every exon of a gene, so a gene
+    #    would only count as covered if 100% of ALL its bases were >= min_depth,
+    #    which almost nothing passes even at high mean coverage.)
+    grp = (df.assign(_id = df[chrom].astype(str)+":"+
+                           s.astype("Int64").astype(str)+"-"+
+                           e.astype("Int64").astype(str))
+             .groupby("_id", as_index=False).agg(len_sum=("_len","sum"), thr_sum=("_thr","sum")))
 
     total_regions = int(len(grp))
     if total_regions == 0:
