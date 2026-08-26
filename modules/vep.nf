@@ -3,6 +3,9 @@ nextflow.enable.dsl=2
 
 // -------- Parameters (used by processes) --------
 params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_MANE_exons_50bp.bed"
+// Somatic reporting panel — restricts the somatic (Mutect2) call set to the
+// genes we report on, the same way params.bed scopes the germline ACMG SF set.
+params.somatic_bed = params.somatic_bed ?: "${workflow.projectDir}/data/Somatic_125genes_MANE_50bp.bed"
 params.outdir      = params.outdir      ?: "results"
 params.scriptdir   = params.scriptdir   ?: "${workflow.projectDir}/scripts"
 params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/template-files"
@@ -411,6 +414,24 @@ process LeanReport {
 
 // ── Somatic-specific VCF processing (no publishDir on intermediates) ──────────
 
+// Restrict the somatic call set to the reporting panel. Runs before
+// NormalizeSomatic so the expensive VEP step only annotates in-panel variants.
+process BedFilterSomatic {
+  tag { "${meta.sample}" }
+  input:
+    tuple val(meta), path(vcf)
+    path bed
+  output:
+    tuple val(meta), path("${meta.sample}.somatic.panel.vcf.gz")
+  script:
+    def sample = meta.sample
+  """
+  tabix -p vcf $vcf || bcftools index -t $vcf
+  bcftools view -R $bed $vcf -Oz -o ${sample}.somatic.panel.vcf.gz
+  tabix -p vcf ${sample}.somatic.panel.vcf.gz
+  """
+}
+
 process NormalizeSomatic {
   tag { "${meta.sample}" }
   input:
@@ -419,18 +440,6 @@ process NormalizeSomatic {
     tuple val(meta), path("${meta.sample}.somatic.norm.vcf.gz")
   script:
     def sample = meta.sample
-    // Tumor-only samples have no matched normal, so FilterMutectCalls cannot use
-    // NLOD / normal_artifact to suppress germline and artefact calls. Apply three
-    // post-hoc exclusion filters to tighten the PASS set:
-    //   1. INFO/POPAF   >= 3.0  — remove common germline (gnomAD AF > 0.001)
-    //   2. FORMAT/AF    >= 0.05 — drop the 0–5% VAF bin (high FP rate without normal)
-    //   3. FORMAT/AD[0:1] >= 5  — require at least 5 alt-supporting reads
-    //      (bcftools needs AD[sample:subfield]; tumor-only VCFs have one sample)
-    // Paired samples skip these: MUTECT2_RESCUE already promoted valid
-    // contamination-tagged variants back, and NLOD suppression did its job.
-    //
-    // The filter runs AFTER `norm -m -any` so every record is single-ALT and the
-    // [0:0]/[0:1] subfield indices refer unambiguously to that one alt allele.
     def tumorOnlyFilter = (meta.somatic_type == 'tumor_only')
         ? "| bcftools filter -i 'INFO/POPAF >= 3.0 && FORMAT/AF[0:0] >= 0.05 && FORMAT/AD[0:1] >= 5' "
         : ""
@@ -607,17 +616,17 @@ workflow POST_SAREK {
 }
 
 // ── Somatic VEP annotation subworkflow ────────────────────────────────────────
-// Normalizes and VEP-annotates the rescued Mutect2 VCF.
-// Output published to ${outdir}/${sample}/somatic/${sample}.somatic.vep.vcf
-// Call POST_SAREK_SOMATIC in somatic mode before POST_SAREK; pass
-// POST_SAREK_SOMATIC.out.somatic_vep as the 4th arg to POST_SAREK.
 
 workflow POST_SAREK_SOMATIC {
   take:
-    vcf_ch  // tuple(meta, rescued_vcf) — output of MUTECT2_RESCUE (with meta)
+    vcf_ch          // tuple(meta, rescued_vcf) — output of MUTECT2_RESCUE (with meta)
+    somatic_bed_ch  // value channel with the somatic reporting panel BED
 
   main:
-    NormalizeSomatic(vcf_ch)
+    // Restrict to the reporting panel first, so NormalizeSomatic's filters and
+    // VEP annotation only ever see in-panel variants.
+    BedFilterSomatic(vcf_ch, somatic_bed_ch)
+    NormalizeSomatic(BedFilterSomatic.out)
     AddVAFSomatic(NormalizeSomatic.out)
 
     somatic_vep_ch = params.run_vep ? VEP_Annotate_Somatic(

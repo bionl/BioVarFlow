@@ -527,7 +527,6 @@ def clinvar_url_from_row(r):
 
     # Else try ALLELEID
     alleleid = first_token(r.get("ALLELEID"))
-    print(alleleid)
     if alleleid:
         # keep only digits
         m = re.search(r"\d+", alleleid)
@@ -1037,26 +1036,51 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     ]
     df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
 
-    # 6) Somatic Variants (rescued Mutect2 VCF, VEP-annotated)
+    # 6) Somatic Variants (rescued Mutect2 VCF, VEP-annotated, panel-restricted)
+    #    The VCF reaching here is already filtered to the somatic reporting panel
+    #    (params.somatic_bed) by BedFilterSomatic, so no gene-list filter is
+    #    applied on this side.
     som_df = parse_somatic_vcf(args.somatic_vcf)
+    som_cols = [
+        "Gene", "Variant", "HGVSc", "HGVSp", "Transcript",
+        "Consequence", "Impact",
+        "VAF", "AD_Ref", "AD_Alt", "DP",
+        "TLOD", "POPAF",
+        "gnomAD_AF",
+        "ClinVar", "ClinVar_ReviewStatus", "ClinVar_Stars", "ClinVar_StarsGlyph",
+        "ClinVar_Link",
+        "REVEL", "SpliceAI_DS_max", "SpliceAI_Event",
+        "BayesDel_score", "AM_Pathogenicity", "AM_Class",
+    ]
+    empty_som_cols = ["Gene","Variant","Consequence","VAF","AD_Alt","DP","TLOD","ClinVar"]
+
     if not som_df.empty:
-        som_cols = [
-            "Gene", "Variant", "HGVSc", "HGVSp", "Transcript",
-            "Consequence", "Impact",
-            "VAF", "AD_Ref", "AD_Alt", "DP",
-            "TLOD", "POPAF",
-            "gnomAD_AF",
-            "ClinVar", "ClinVar_ReviewStatus", "ClinVar_Stars", "ClinVar_StarsGlyph",
-            "REVEL", "SpliceAI_DS_max", "SpliceAI_Event",
-            "BayesDel_score", "AM_Pathogenicity", "AM_Class",
-        ]
+        # Add a ClinVar hyperlink column, mirroring the ACMG SF sheet.
+        som_df = som_df.copy()
+        som_df["ClinVar_URL"] = som_df.apply(clinvar_url_from_row, axis=1)
+        som_df["ClinVar_Link"] = som_df["ClinVar_URL"].map(
+            lambda u: f'=HYPERLINK("{u}","{u}")' if u else ""
+        )
         # keep only columns that are present (future-proof)
-        som_cols = [c for c in som_cols if c in som_df.columns]
-        som_df[som_cols].to_excel(xw, index=False, sheet_name="Somatic Variants")
+        present_cols = [c for c in som_cols if c in som_df.columns]
+        som_df[present_cols].to_excel(xw, index=False, sheet_name="Somatic Variants")
+
+        # 7) Somatic Panel (P/LP) — ClinVar pathogenic subset of the panel calls,
+        #    the somatic counterpart of the "ACMG SF (P-LP)" sheet.
+        if "ClinVar" in som_df.columns:
+            som_plp = som_df[
+                som_df["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)
+            ]
+        else:
+            som_plp = som_df.iloc[0:0]
+        som_plp[present_cols].to_excel(xw, index=False, sheet_name="Somatic Panel (P-LP)")
     else:
-        # write an empty placeholder so the tab always exists when the pipeline runs
-        pd.DataFrame(columns=["Gene","Variant","Consequence","VAF","AD_Alt","DP","TLOD","ClinVar"]).to_excel(
+        # write empty placeholders so the tabs always exist when the pipeline runs
+        pd.DataFrame(columns=empty_som_cols).to_excel(
             xw, index=False, sheet_name="Somatic Variants"
+        )
+        pd.DataFrame(columns=empty_som_cols).to_excel(
+            xw, index=False, sheet_name="Somatic Panel (P-LP)"
         )
 
 print(f"Wrote Excel report → {args.xlsx_out}")

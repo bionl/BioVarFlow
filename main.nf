@@ -74,6 +74,15 @@ def validateBedFile() {
     return bedFile
 }
 
+// Somatic reporting panel BED — only required in somatic mode.
+def validateSomaticBedFile() {
+    def bedFile = params.somatic_bed ? file(params.somatic_bed) : null
+    if (!bedFile?.exists()) {
+        error "❌ Somatic panel BED file not found: ${params.somatic_bed}"
+    }
+    return bedFile
+}
+
 // Reads the somatic samplesheet and injects a duplicate status=0 row (with a
 // _germline patient/sample suffix) for every tumor-only sample — i.e. any
 // patient that has a status=1 row but no matching status=0 row.  The two rows
@@ -664,7 +673,8 @@ workflow RUN_FULL_VARIANT_CALLING {
                 tuple(meta + [somatic_type: somType], vcf)
             }
 
-            POST_SAREK_SOMATIC(somatic_input_ch)
+            def somatic_bed_ch = Channel.value(validateSomaticBedFile())
+            POST_SAREK_SOMATIC(somatic_input_ch, somatic_bed_ch)
 
             // Strip somatic_type back out so the meta key matches the HC germline
             // channel ([sample, assay]) for the join inside POST_SAREK.
