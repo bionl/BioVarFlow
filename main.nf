@@ -33,6 +33,7 @@ include { MUTECT2_RESCUE } \
 params.input                  = params.input ?: params.samplesheet
 params.outdir                 = params.outdir ?: params.output
 params.bed                    = params.bed ?: "${workflow.projectDir}/data/ACMG_SF_MANE_exons_50bp.bed"
+params.somatic_bed            = params.somatic_bed ?: "${workflow.projectDir}/data/Somatic_125genes_MANE_50bp.bed"
 //params.run_variant_calling    = params.run_variant_calling instanceof Boolean ? params.run_variant_calling : true
 params.create_consensus       = params.create_consensus instanceof Boolean ? params.create_consensus : true
 params.run_db_qc              = params.run_db_qc instanceof Boolean ? params.run_db_qc : true
