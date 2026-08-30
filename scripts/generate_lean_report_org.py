@@ -31,7 +31,9 @@ p.add_argument("--acmg-thresholds", default=None,
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
 p.add_argument("--somatic-vcf", default=None,
-               help="VEP-annotated rescued Mutect2 VCF — adds a Somatic Variants tab")
+               help="VEP-annotated, panel-restricted somatic VCF containing ALL "
+                    "in-panel calls (FILTER preserved). PASS and the tumor-only "
+                    "post-hoc thresholds are applied here when building the sheets.")
 
 
 
@@ -608,6 +610,25 @@ def parse_spliceai(val):
 # -------------------------
 # Somatic VCF parser
 # -------------------------
+def somatic_is_tumor_only(vcf_path):
+    """
+    True when the somatic VCF has no matched normal.
+
+    Mutect2 writes ##tumor_sample= (and ##normal_sample= when paired), and a
+    paired VCF carries two FORMAT columns while a tumor-only VCF carries one.
+    This distinction decides whether the post-hoc POPAF/VAF/alt-read thresholds
+    apply: they exist to compensate for the missing normal, so paired calls —
+    which already went through NLOD suppression and MUTECT2_RESCUE — skip them.
+    """
+    if not vcf_path or not os.path.exists(vcf_path):
+        return False
+    try:
+        v = VCF(vcf_path)
+        return len(list(v.samples)) < 2
+    except Exception:
+        return False
+
+
 def parse_somatic_vcf(vcf_path):
     """
     Parse a VEP-annotated rescued Mutect2 VCF into a DataFrame.
@@ -622,13 +643,25 @@ def parse_somatic_vcf(vcf_path):
 
     # CSQ format from header
     csq_fmt = []
+    tumor_sample = None
     for h in vcf_s.raw_header.split("\n"):
         if h.startswith("##INFO=<ID=CSQ"):
             try:
                 csq_fmt = h.split("Format: ")[1].rstrip('">').split("|")
             except Exception:
                 pass
-            break
+        elif h.startswith("##tumor_sample="):
+            tumor_sample = h.split("=", 1)[1].strip()
+
+    # Which FORMAT column holds the TUMOR.  Mutect2 writes the normal FIRST in
+    # paired VCFs, so index 0 is the NORMAL there — reading it would report the
+    # normal's depth/VAF for every somatic call (alt support is in the tumor
+    # column).  Mutect2 records the tumor's name in the ##tumor_sample header;
+    # use it to pick the right column.  Tumor-only VCFs have a single sample and
+    # no such header, so index 0 is correct and the fallback applies.
+    ti = 0
+    if tumor_sample and tumor_sample in list(vcf_s.samples):
+        ti = list(vcf_s.samples).index(tumor_sample)
 
     rows = []
     for var in vcf_s:
@@ -652,24 +685,25 @@ def parse_somatic_vcf(vcf_path):
         except Exception:
             pass
 
-        # FORMAT fields — Mutect2 uses AF (not VAF)
+        # FORMAT fields — Mutect2 uses AF (not VAF).
+        # Indexed by `ti` (tumor column), not 0 — see the ##tumor_sample note above.
         af = dp = ad_ref = ad_alt = None
         try:
             arr = var.format("AF")
             if arr is not None:
-                af = round(float(arr[0][0]), 4)
+                af = round(float(arr[ti][0]), 4)
         except Exception:
             pass
         try:
             arr = var.format("DP")
             if arr is not None:
-                dp = int(arr[0][0])
+                dp = int(arr[ti][0])
         except Exception:
             pass
         try:
             arr = var.format("AD")
             if arr is not None:
-                ad_ref, ad_alt = int(arr[0][0]), int(arr[0][1])
+                ad_ref, ad_alt = int(arr[ti][0]), int(arr[ti][1])
         except Exception:
             pass
 
@@ -713,9 +747,15 @@ def parse_somatic_vcf(vcf_path):
         stars  = clinvar_stars_from_revstat(clinvar_review_status or "")
         revstat = clinvar_review_status or ""
 
+        # FILTER as written by FilterMutectCalls (after MUTECT2_RESCUE). cyvcf2
+        # gives None for PASS; anything else is a semicolon-joined tag list.
+        # Needed by the "all panel variants" tab to show why a call was excluded.
+        filter_str = var.FILTER if var.FILTER else "PASS"
+
         rows.append({
             "Gene":                gene,
             "Variant":             f"{chrom}:{pos}:{ref}:{alt}",
+            "FILTER":              filter_str,
             "Chrom":               chrom,
             "Pos":                 pos,
             "Ref":                 ref,
@@ -1036,11 +1076,13 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     ]
     df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
 
-    # 6) Somatic Variants (rescued Mutect2 VCF, VEP-annotated, panel-restricted)
-    #    The VCF reaching here is already filtered to the somatic reporting panel
-    #    (params.somatic_bed) by BedFilterSomatic, so no gene-list filter is
-    #    applied on this side.
-    som_df = parse_somatic_vcf(args.somatic_vcf)
+    # ── Somatic sheets ────────────────────────────────────────────────────────
+    # One VEP-annotated VCF arrives holding EVERY in-panel call with its FILTER
+    # intact (BedFilterSomatic restricted it to params.somatic_bed; nothing was
+    # dropped after that). All three views are derived here so VEP runs once.
+    som_all_df   = parse_somatic_vcf(args.somatic_vcf)
+    is_tumor_only = somatic_is_tumor_only(args.somatic_vcf)
+
     som_cols = [
         "Gene", "Variant", "HGVSc", "HGVSp", "Transcript",
         "Consequence", "Impact",
@@ -1054,19 +1096,47 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     ]
     empty_som_cols = ["Gene","Variant","Consequence","VAF","AD_Alt","DP","TLOD","ClinVar"]
 
-    if not som_df.empty:
-        # Add a ClinVar hyperlink column, mirroring the ACMG SF sheet.
-        som_df = som_df.copy()
-        som_df["ClinVar_URL"] = som_df.apply(clinvar_url_from_row, axis=1)
-        som_df["ClinVar_Link"] = som_df["ClinVar_URL"].map(
+    def _posthoc_reason(r):
+        """Which post-hoc threshold(s) rejected an otherwise-PASS call.
+
+        Tumor-only has no matched normal, so FilterMutectCalls cannot use
+        NLOD/normal_artifact; these thresholds compensate. Paired calls skip
+        them (MUTECT2_RESCUE already restored the valid ones), so the column
+        stays empty there.
+        """
+        if not is_tumor_only:
+            return ""
+        if str(r.get("FILTER", "")) != "PASS":
+            return ""              # already excluded by FilterMutectCalls
+        reasons = []
+        popaf, vaf, ad_alt = r.get("POPAF"), r.get("VAF"), r.get("AD_Alt")
+        if pd.notna(popaf)  and float(popaf)  <  3.0:  reasons.append("POPAF<3")
+        if pd.notna(vaf)    and float(vaf)    <  0.05: reasons.append("VAF<0.05")
+        if pd.notna(ad_alt) and float(ad_alt) <  5:    reasons.append("AD_Alt<5")
+        return ";".join(reasons)
+
+    if not som_all_df.empty:
+        som_all_df = som_all_df.copy()
+        som_all_df["ClinVar_URL"]  = som_all_df.apply(clinvar_url_from_row, axis=1)
+        som_all_df["ClinVar_Link"] = som_all_df["ClinVar_URL"].map(
             lambda u: f'=HYPERLINK("{u}","{u}")' if u else ""
         )
-        # keep only columns that are present (future-proof)
-        present_cols = [c for c in som_cols if c in som_df.columns]
+        som_all_df["PostHoc_Excluded_By"] = som_all_df.apply(_posthoc_reason, axis=1)
+
+        present_cols = [c for c in som_cols if c in som_all_df.columns]
+
+        # Reported set: PASS, plus the tumor-only thresholds when they apply.
+        som_df = som_all_df[
+            (som_all_df["FILTER"] == "PASS") & (som_all_df["PostHoc_Excluded_By"] == "")
+        ]
+
+        # 6) Somatic Variants — the reported panel calls
         som_df[present_cols].to_excel(xw, index=False, sheet_name="Somatic Variants")
 
-        # 7) Somatic Panel (P/LP) — ClinVar pathogenic subset of the panel calls,
-        #    the somatic counterpart of the "ACMG SF (P-LP)" sheet.
+        # 7) Somatic Panel (P/LP) — ClinVar-pathogenic subset of the reported set.
+        #    NOTE: ClinVar is a germline resource and under-calls somatic drivers;
+        #    an oncology knowledgebase (OncoKB / CIViC) is the right key here once
+        #    a GRCh38 source is wired in.
         if "ClinVar" in som_df.columns:
             som_plp = som_df[
                 som_df["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)
@@ -1074,13 +1144,19 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         else:
             som_plp = som_df.iloc[0:0]
         som_plp[present_cols].to_excel(xw, index=False, sheet_name="Somatic Panel (P-LP)")
+
+        # 8) Somatic Panel (all) — QC tab: every in-panel call with the reason it
+        #    was excluded. NOT a reporting sheet.
+        all_first = ["FILTER", "PostHoc_Excluded_By"]
+        present_all = all_first + [c for c in present_cols if c not in all_first]
+        som_all_df[present_all].to_excel(xw, index=False, sheet_name="Somatic Panel (all)")
     else:
-        # write empty placeholders so the tabs always exist when the pipeline runs
-        pd.DataFrame(columns=empty_som_cols).to_excel(
-            xw, index=False, sheet_name="Somatic Variants"
+        # empty placeholders so the tabs always exist when the pipeline runs
+        for sheet in ("Somatic Variants", "Somatic Panel (P-LP)"):
+            pd.DataFrame(columns=empty_som_cols).to_excel(xw, index=False, sheet_name=sheet)
+        pd.DataFrame(columns=["FILTER","PostHoc_Excluded_By"] + empty_som_cols).to_excel(
+            xw, index=False, sheet_name="Somatic Panel (all)"
         )
-        pd.DataFrame(columns=empty_som_cols).to_excel(
-            xw, index=False, sheet_name="Somatic Panel (P-LP)"
-        )
+
 
 print(f"Wrote Excel report → {args.xlsx_out}")

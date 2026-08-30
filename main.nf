@@ -665,24 +665,13 @@ workflow RUN_FULL_VARIANT_CALLING {
             def normalToTumorMap  = samplesheetForMap ? buildNormalToTumorMap(samplesheetForMap) : [:]
 
             // ── Somatic VEP annotation (rescued Mutect2 VCF → somatic.vep.vcf) ──
-            // Tag each rescued VCF with somatic_type so NormalizeSomatic applies the
-            // right post-hoc filters:
-            //   paired     → PASS only (rescue already promoted valid variants back)
-            //   tumor_only → PASS + POPAF/VAF/alt-read filters to cut the FP rate
-            def somatic_input_ch = vcf_with_meta_ch.map { meta, vcf ->
-                def somType = normalToTumorMap.values().toSet().contains(meta.sample) ? 'paired' : 'tumor_only'
-                tuple(meta + [somatic_type: somType], vcf)
-            }
-
+            // The full in-panel set is annotated once; PASS and the tumor-only
+            // post-hoc thresholds are applied in the report script, which infers
+            // paired vs tumor-only from the VCF's own ##tumor_sample header.
             def somatic_bed_ch = Channel.value(validateSomaticBedFile())
-            POST_SAREK_SOMATIC(somatic_input_ch, somatic_bed_ch)
+            POST_SAREK_SOMATIC(vcf_with_meta_ch, somatic_bed_ch)
 
-            // Strip somatic_type back out so the meta key matches the HC germline
-            // channel ([sample, assay]) for the join inside POST_SAREK.
             def somatic_vep_ch = POST_SAREK_SOMATIC.out.somatic_vep
-                .map { meta, vcf ->
-                    tuple([ sample: meta.sample, assay: meta.assay ], vcf)
-                }
 
             // ── HC VCF collection — all filtered VCFs from haplotypecaller output ──
             def all_hc_vcf_ch = NFCORE_SAREK.out.multiqc_report

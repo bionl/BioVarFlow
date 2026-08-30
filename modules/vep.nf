@@ -396,8 +396,8 @@ process LeanReport {
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants_lean.xlsx")
   script:
-    def sample   = meta.sample
-    def som_arg  = somatic_vcf.name != 'NO_FILE' ? "--somatic-vcf ${somatic_vcf}" : ""
+    def sample  = meta.sample
+    def som_arg = somatic_vcf.name != 'NO_FILE' ? "--somatic-vcf ${somatic_vcf}" : ""
   """
   mkdir -p ${sample}_report
   python ${script} \
@@ -440,14 +440,13 @@ process NormalizeSomatic {
     tuple val(meta), path("${meta.sample}.somatic.norm.vcf.gz")
   script:
     def sample = meta.sample
-    def tumorOnlyFilter = (meta.somatic_type == 'tumor_only')
-        ? "| bcftools filter -i 'INFO/POPAF >= 3.0 && FORMAT/AF[0:0] >= 0.05 && FORMAT/AD[0:1] >= 5' "
-        : ""
+    // Normalization only — no PASS gate and no post-hoc thresholds here.
+    // VEP runs once over the full in-panel set, and the report script applies
+    // PASS + the tumor-only thresholds when building each sheet. Keeping the
+    // filtering in one place (Python) also lets the QC tab explain *why* a
+    // variant was excluded instead of it silently disappearing upstream.
   """
-  bcftools view -f PASS $vcf \\
-    | bcftools norm -m -any \\
-    ${tumorOnlyFilter}\\
-    -Oz -o ${sample}.somatic.norm.vcf.gz
+  bcftools norm -m -any $vcf -Oz -o ${sample}.somatic.norm.vcf.gz
   tabix -p vcf ${sample}.somatic.norm.vcf.gz
   """
 }
@@ -623,9 +622,13 @@ workflow POST_SAREK_SOMATIC {
     somatic_bed_ch  // value channel with the somatic reporting panel BED
 
   main:
-    // Restrict to the reporting panel first, so NormalizeSomatic's filters and
-    // VEP annotation only ever see in-panel variants.
+    // Restrict to the reporting panel first — everything downstream, VEP
+    // included, only ever sees in-panel variants.
     BedFilterSomatic(vcf_ch, somatic_bed_ch)
+
+    // Annotate the FULL in-panel set once. PASS and the tumor-only thresholds
+    // are applied downstream in the report script, so VEP runs a single time
+    // per sample regardless of how many views of the data the report needs.
     NormalizeSomatic(BedFilterSomatic.out)
     AddVAFSomatic(NormalizeSomatic.out)
 
@@ -650,5 +653,7 @@ workflow POST_SAREK_SOMATIC {
     ) : AddVAFSomatic.out
 
   emit:
-    somatic_vep = somatic_vep_ch  // tuple(meta, somatic.vep.vcf)
+    // tuple(meta, <sample>.somatic.vep.vcf) — every in-panel call, annotated,
+    // FILTER preserved. The report script derives the reported and QC views.
+    somatic_vep = somatic_vep_ch
 }
