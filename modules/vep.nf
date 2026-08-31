@@ -18,7 +18,6 @@ params.min_qual = params.min_qual ?: 10
 
 process BedFilterVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
   input:
     tuple val(meta), path(vcf)
     path bed
@@ -35,7 +34,6 @@ process BedFilterVCF {
 
 process NormalizeVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
   input:
     tuple val(meta), path(vcf)
   output:
@@ -50,7 +48,6 @@ process NormalizeVCF {
 
 process FilterVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
   input:
     tuple val(meta), path(vcf)
   output:
@@ -65,7 +62,6 @@ process FilterVCF {
 
 process AddVAF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
   input:
     tuple val(meta), path(vcf)
   output:
@@ -80,7 +76,6 @@ process AddVAF {
 
 process BedFilterBAM {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
   input:
     tuple val(meta), path(vcf), path(bam)
     path bed
@@ -120,7 +115,6 @@ process CoverageSummary {
 
 process R1R2Ratio {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay   
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
   input:
     tuple val(meta), path(bam), path(bai)
     path bed
@@ -140,7 +134,6 @@ process R1R2Ratio {
 
 process ForwardReverseRatio {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
   input:
     tuple val(meta), path(bam), path(bai)
     path bed
