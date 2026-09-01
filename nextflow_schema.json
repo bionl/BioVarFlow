@@ -19,6 +19,13 @@
           "format": "file-path",
           "pattern": "^\\S*\\.csv$"
         },
+        "input_bam": {
+          "type": "string",
+          "title": "BAM samplesheet (start from mapped data)",
+          "description": "CSV samplesheet with already-mapped BAM files. When provided, the pipeline skips alignment and starts from markduplicates. Required columns: patient, assay,sex, status, sample, bam, bai. Mutually exclusive with --input.",
+          "format": "file-path",
+          "pattern": "^\\S*\\.csv$"
+        },
         "outdir": {
           "type": "string",
           "title": "Output directory",
