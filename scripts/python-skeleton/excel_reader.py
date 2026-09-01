@@ -187,8 +187,9 @@ class ExcelDataReader:
             }
 
         df = data['ACMG SF (P-LP)']
-        # Filter for pathogenic/likely pathogenic variants
-        pathogenic_mask = df['ClinVar'].isin(['Pathogenic', 'Likely pathogenic','Conflicting_classifications_of_pathogenicity'])
+        pathogenic_mask = df['ClinVar'].astype(str).str.contains(
+            'pathogenic', case=False, na=False
+        )
         pathogenic_variants = df[pathogenic_mask]
 
         # Split based on star rating (>=2 stars for Page 1, <2 stars for Page 2)
