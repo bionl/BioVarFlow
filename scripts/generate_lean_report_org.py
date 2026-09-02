@@ -2,7 +2,7 @@
 import sys, os, re, argparse
 import pandas as pd
 from cyvcf2 import VCF
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 # -------------------------
 # CLI
@@ -698,8 +698,11 @@ for var in vcf:
         ann = select_csq_entry(var, csq_format) or {}
         gene        = ann.get("SYMBOL")
         transcript  = ann.get("Feature")
-        hgvsc       = ann.get("HGVSc")
-        hgvsp       = ann.get("HGVSp")
+        # VEP percent-encodes reserved characters inside CSQ subfields, so a
+        # synonymous change arrives as "p.Gln342%3D" instead of "p.Gln342=".
+        # Decode here so both the Excel and the HTML report show valid HGVS.
+        hgvsc       = unquote(ann["HGVSc"]) if ann.get("HGVSc") else ann.get("HGVSc")
+        hgvsp       = unquote(ann["HGVSp"]) if ann.get("HGVSp") else ann.get("HGVSp")
         consequence = ann.get("Consequence")
         mane_id = ann.get("MANE_SELECT")
         exon        = ann.get("EXON")
