@@ -547,6 +547,31 @@ def clinvar_stars_from_revstat(revstat: str) -> int:
 def clinvar_star_glyph(n):
     return "★"*int(n) if isinstance(n,(int,float)) and n>=0 else ""
 
+def is_benign_clinvar(clinvar_val):
+    """
+    True only for an exact Benign / Likely_benign classification (including
+    combined "Benign/Likely_benign" and "Benign&Likely_benign").
+
+    Used to EXCLUDE variants from the per-gene-set reporting sheets: within a
+    curated panel we surface everything except what ClinVar has actually called
+    benign. Deliberately exact-token, so terms that merely contain the word --
+    e.g. "Conflicting_classifications_of_pathogenicity" -- are not treated as
+    benign and stay in the sheet.
+
+    Star rating is intentionally NOT considered here. Gating the exclusion on
+    ClinVar_Stars >= 2 would let ~80% of benign calls back in (most sit at 0-1
+    stars), while gating on stars alone would delete high-confidence PATHOGENIC
+    findings, which are the most reportable variants in the panel.
+    """
+    if not clinvar_val:
+        return False
+    exact = {"benign", "likely benign"}
+    for tok in re.split(r"[&/|,]", str(clinvar_val)):
+        if tok.strip().lower().replace("_", " ") in exact:
+            return True
+    return False
+
+
 def is_pathogenic_clinvar(clinvar_val):
     """
     True only for an exact Pathogenic / Likely_pathogenic classification
@@ -933,11 +958,14 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         variants = df.copy()
         variants["ClinVar_URL"] = variants.apply(clinvar_url_from_row, axis=1)
         variants["ClinVar_Link"] = variants["ClinVar_URL"].map(make_hyperlink)
+        # Exclusion, not inclusion: inside a curated gene panel we report
+        # everything ClinVar has NOT called benign — so pathogenic, likely
+        # pathogenic, conflicting, VUS, and variants with no ClinVar entry all
+        # stay. Only an explicit Benign / Likely_benign classification drops a
+        # variant. See is_benign_clinvar() for why star rating is not part of
+        # this decision.
         if "ClinVar" in variants.columns:
-            variants = variants[variants["ClinVar"].astype(str).str.contains("pathogenic", case=False, na=False)]
-            #variants = variants[variants["ClinVar_Stars"].fillna(0).astype(int) >= 2]
-        else:
-            variants = variants.iloc[0:0]
+            variants = variants[~variants["ClinVar"].map(is_benign_clinvar)]
         if gene_set:
             variants = variants[variants["Gene"].isin(gene_set)]
         variants[variant_cols].to_excel(xw, index=False, sheet_name=variants_sheet)
