@@ -2,7 +2,7 @@
 import sys, os, re, argparse
 import pandas as pd
 from cyvcf2 import VCF
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 # -------------------------
 # CLI
@@ -290,20 +290,32 @@ def read_acmg_thresholds(th_path, sf_genes=None):
     end   = col("end")   or "end"
     region= col("region")  # may be None if no label in BED
 
-    # Synthesize RegionLabel if missing/blank
-    if (region is None) or (region == 'NA') or (region not in df.columns):
-        df["RegionLabel"] = df[chrom].astype(str) + ":" + df[start].astype(int).astype(str) + "-" + df[end].astype(int).astype(str)
-    else:
-        # If region exists but is empty/unknown, still fall back to coords
-        df["RegionLabel"] = df[region].astype(str)
-        mask_empty = df["RegionLabel"].isin(["", ".", "unknown", "UNKNOWN", "None"])
-        df.loc[mask_empty, "RegionLabel"] = df.loc[mask_empty, chrom].astype(str) + ":" + df.loc[mask_empty, start].astype(int).astype(str) + "-" + df.loc[mask_empty, end].astype(int).astype(str)
+    # RegionLabel is the JOIN KEY against the gaps BED, so it must be unique per
+    # exon. The BED's 4th column is GENE|TRANSCRIPT and repeats across every exon
+    # of a gene — keying on it collapsed gaps to gene level and stamped one
+    # gene-wide total onto all ~2,088 exon rows. Key on exon coordinates instead;
+    # CoverageGapsAnnotation labels gaps the same way.
+    df["RegionLabel"] = (df[chrom].astype(str) + ":" +
+                         df[start].astype(int).astype(str) + "-" +
+                         df[end].astype(int).astype(str))
 
-    # Optional gene parsing (will be '.' if no names)
-    parts = df["RegionLabel"].astype(str).str.split("|", n=2, expand=True)
-    df["Gene"] = parts[0] if parts.shape[1] > 0 else "."
-    df["MANE_ID"] = parts[1] if parts.shape[1] > 1 else "."
-    df["Exon"] = parts[2] if parts.shape[1] > 2 else "."
+    # Gene / transcript still come from the BED's label column when present.
+    if (region is not None) and (region != 'NA') and (region in df.columns):
+        lbl = df[region].astype(str)
+        lbl = lbl.where(~lbl.isin(["", ".", "unknown", "UNKNOWN", "None"]), other=".")
+        parts = lbl.str.split("|", n=2, expand=True)
+        df["Gene"]    = parts[0] if parts.shape[1] > 0 else "."
+        df["MANE_ID"] = parts[1] if parts.shape[1] > 1 else "."
+    else:
+        df["Gene"] = "."
+        df["MANE_ID"] = "."
+
+    # Exon number: the BED carries no exon index, so derive one by ordering each
+    # gene's intervals along the genome. Previously this column was always "."
+    # because splitting GENE|TRANSCRIPT never yielded a third field.
+    _ord = df.assign(_s=pd.to_numeric(df[start], errors="coerce"))
+    df["Exon"] = (_ord.groupby("Gene")["_s"].rank(method="dense").astype("Int64").astype(str))
+    df.loc[df["Gene"] == ".", "Exon"] = "."
 
     if sf_genes:
         df = df[df["Gene"].isin(sf_genes)]
@@ -789,8 +801,11 @@ for var in vcf:
         ann = select_csq_entry(var, csq_format) or {}
         gene        = ann.get("SYMBOL")
         transcript  = ann.get("Feature")
-        hgvsc       = ann.get("HGVSc")
-        hgvsp       = ann.get("HGVSp")
+        # VEP percent-encodes reserved characters inside CSQ subfields, so a
+        # synonymous change arrives as "p.Gln342%3D" instead of "p.Gln342=".
+        # Decode here so both the Excel and the HTML report show valid HGVS.
+        hgvsc       = unquote(ann["HGVSc"]) if ann.get("HGVSc") else ann.get("HGVSc")
+        hgvsp       = unquote(ann["HGVSp"]) if ann.get("HGVSp") else ann.get("HGVSp")
         consequence = ann.get("Consequence")
         mane_id = ann.get("MANE_SELECT")
         exon        = ann.get("EXON")
@@ -871,6 +886,76 @@ for var in vcf:
     records.append(rec)
 
 df = pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
+# Multiallelic site reconciliation
+# ---------------------------------------------------------------------------
+# `bcftools norm -m -any` splits a multiallelic site into one biallelic record
+# per ALT. That is required for annotation, but it loses site-level context in
+# ways that misrepresent the variant:
+#
+#   * GT becomes 1/0 and 0/1 (a biallelic record cannot express 1/2), so
+#     Zygosity reads "het" for a site carrying no reference allele at all.
+#   * FORMAT/AD is subset to [ref, this_alt], so the OTHER alt's reads vanish
+#     from the VAF denominator. bcftools computes VAF as alt/(ref+alt), which
+#     for a 1/2 site inflates every allele — ACTC1 chr15:34791307 (AD 0,24,17,
+#     DP 41) reported VAF 1.000 for BOTH alleles instead of 0.585 / 0.415.
+#
+# Rebuild the site by grouping the split records back together on coordinates,
+# then recompute VAF against total allele-informative depth at the site
+# (AD_Ref + sum of every ALT's AD) and restate the genotype.
+if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
+    _key = ["Chrom", "Pos"]
+    _ar = pd.to_numeric(df["AD_Ref"], errors="coerce")
+    _aa = pd.to_numeric(df["AD_Alt"], errors="coerce")
+
+    _n_alt   = df.groupby(_key)["AD_Alt"].transform("size")
+    _alt_sum = _aa.groupby([df[c] for c in _key]).transform("sum")
+    # AD_Ref is the site's reference depth, repeated on each split row — take it
+    # once, not once per ALT.
+    _site_ad = _ar + _alt_sum
+
+    df["Multiallelic"] = (_n_alt > 1).map({True: "Y", False: "N"})
+    df["Site_AD_Total"] = _site_ad.astype("Int64")
+
+    # VAF against site-level informative depth. Single-ALT rows are unchanged
+    # (ref + alt is already the site total).
+    _vaf_site = (_aa / _site_ad).where(_site_ad > 0)
+    df["VAF"] = _vaf_site.round(4)
+
+    # Restate the genotype for split rows. A 1/2 site is heterozygous for two
+    # different ALT alleles; "het" alone hides that there is no ref allele.
+    _multi = _n_alt > 1
+    df["GT_site"] = df["GT"]
+    df.loc[_multi, "GT_site"] = "1/2"
+    df.loc[_multi, "Zygosity"] = "het (1/2)"
+
+    # ---- QC flags -------------------------------------------------------
+    # AD counts allele-assigned reads; DP counts all reads at the locus, so a
+    # gap between them is normal (uninformative/filtered reads). Surface it
+    # rather than silently absorbing it into whichever denominator we chose --
+    # e.g. FANCL chr2:58226708 has AD summing to 158 against DP 163.
+    _dp = pd.to_numeric(df["DP"], errors="coerce")
+    df["AD_Sum_vs_DP"] = (_site_ad - _dp).astype("Int64")
+
+    # A hom-ALT call retaining substantial reference support is worth a look:
+    # it can indicate a mis-genotype, CNV, or contamination. COL3A1
+    # chr2:188994708 carries 17/143 ref reads (11.9%) on a 1/1 call.
+    _ref_frac = (_ar / _site_ad).where(_site_ad > 0)
+    _hom_with_ref = df["Zygosity"].astype(str).eq("hom") & (_ref_frac > 0.10)
+
+    _flags = []
+    for _i in df.index:
+        _f = []
+        if _hom_with_ref.get(_i, False):
+            _f.append(f"HOM_REF_SUPPORT={_ref_frac[_i]:.1%}")
+        if pd.notna(df.at[_i, "AD_Sum_vs_DP"]) and df.at[_i, "AD_Sum_vs_DP"] != 0:
+            _f.append(f"AD_DP_DIFF={df.at[_i, 'AD_Sum_vs_DP']}")
+        if df.at[_i, "Multiallelic"] == "Y":
+            _f.append("MULTIALLELIC")
+        _flags.append(";".join(_f))
+    df["QC_Flags"] = _flags
 
 # -------------------------
 # Build tabs

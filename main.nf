@@ -39,7 +39,11 @@ params.run_db_qc              = params.run_db_qc instanceof Boolean ? params.run
 // downstream DB ingestion pipeline). Falls back to workflow.runName at
 // manifest-build time if left null.
 params.run_id                 = params.run_id ?: null
-params.ref_fasta              = params.ref_fasta ?: params.vep_fasta
+// Reference for consensus normalisation. Must be the assembly the BAMs were
+// aligned to (GATK, chr-prefixed) — NOT params.vep_fasta, which is the Ensembl
+// build with 1/2/…/MT contigs and fails bcftools norm -f on every record.
+// params.fasta is assigned by external/sarek/main.nf when it is included above.
+params.ref_fasta              = params.ref_fasta ?: params.fasta
 //params.vep_fasta              = params.vep_fasta ?: params.vep_fasta
 
 // Validate required parameters
