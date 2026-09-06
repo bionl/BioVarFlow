@@ -75,11 +75,25 @@ def isGcsPath(path) {
 // NOT params.vep_fasta, which is the Ensembl build named 1/2/.../MT and fails on
 // every record. Called from inside a workflow body so params.fasta is populated.
 def resolveRefFasta() {
+    // Fallback chain, most-explicit first:
+    //   1. --ref_fasta                        explicit override
+    //   2. params.fasta                       set by external/sarek/main.nf; not
+    //                                         reliably visible from this script's
+    //                                         binding, so never relied on alone
+    //   3. params.genomes[genome].fasta       the igenomes map, loaded via
+    //                                         includeConfig at config-parse time
+    //                                         and therefore always available here
     def f = params.ref_fasta ?: params.fasta
+    if (!f && params.genomes && params.genome && params.genomes.containsKey(params.genome)) {
+        f = params.genomes[params.genome].fasta
+    }
     if (!f) {
-        error "❌ No reference genome for consensus normalisation. Set --ref_fasta " +
-              "to the GATK assembly the BAMs were aligned against (chr-prefixed), " +
-              "or ensure --genome/igenomes resolves params.fasta."
+        error "❌ No reference genome for consensus normalisation.\n" +
+              "   Tried --ref_fasta, params.fasta, and params.genomes[${params.genome}].fasta.\n" +
+              "   genome=${params.genome}  igenomes_ignore=${params.igenomes_ignore}  " +
+              "genomes_loaded=${params.genomes ? params.genomes.size() : 0}\n" +
+              "   Set --ref_fasta to the GATK assembly the BAMs were aligned against " +
+              "(chr-prefixed contigs)."
     }
     return f
 }

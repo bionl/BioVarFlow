@@ -506,9 +506,19 @@ workflow POST_SAREK {
     // Resolved here, not at module load: params.fasta is set by
     // external/sarek/main.nf when it is included, so reading it inside the
     // workflow body guarantees it is populated regardless of include order.
+    // Same fallback chain as main.nf's resolveRefFasta(): params.fasta is set by
+    // external/sarek/main.nf and is not reliably visible from another module's
+    // binding, so fall through to the igenomes map, which config-parse time
+    // always populates.
     def _normFasta = params.norm_fasta ?: params.fasta
+    if (!_normFasta && params.genomes && params.genome && params.genomes.containsKey(params.genome)) {
+        _normFasta = params.genomes[params.genome].fasta
+    }
     if (!_normFasta) {
-        error "❌ No reference for NormalizeVCF. Set --norm_fasta, or ensure params.fasta resolves (genome/igenomes)."
+        error "❌ No reference for NormalizeVCF.\n" +
+              "   Tried --norm_fasta, params.fasta, params.genomes[${params.genome}].fasta.\n" +
+              "   genome=${params.genome}  genomes_loaded=${params.genomes ? params.genomes.size() : 0}\n" +
+              "   Set --norm_fasta to the GATK assembly the BAMs were aligned against."
     }
     norm_fasta_ch = Channel.value(file(_normFasta))
     norm_fai_ch   = Channel.value(file("${_normFasta}.fai"))
