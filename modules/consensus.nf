@@ -7,7 +7,12 @@ params.outdir = params.outdir ?: "results"
 // contigs are chr-prefixed. params.vep_fasta is the Ensembl build (contigs named
 // 1/2/…/MT) and fails on every record, which is why the -f calls below were
 // previously commented out.
-params.ref_fasta = params.ref_fasta ?: params.fasta
+//
+// NOT defaulted to params.fasta here: that value is assigned at include time by
+// external/sarek/main.nf and is not reliably populated while this module's
+// script-level code runs. main.nf resolves it via resolveRefFasta() inside the
+// workflow body and passes the file in as a process input.
+params.ref_fasta = params.ref_fasta ?: null
 
 /********************  CONSENSUS CALLING PROCESSES  ********************/
 process CONS_REHEADER_VCF {

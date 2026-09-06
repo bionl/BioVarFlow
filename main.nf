@@ -39,11 +39,12 @@ params.run_db_qc              = params.run_db_qc instanceof Boolean ? params.run
 // downstream DB ingestion pipeline). Falls back to workflow.runName at
 // manifest-build time if left null.
 params.run_id                 = params.run_id ?: null
-// Reference for consensus normalisation. Must be the assembly the BAMs were
-// aligned to (GATK, chr-prefixed) — NOT params.vep_fasta, which is the Ensembl
-// build with 1/2/…/MT contigs and fails bcftools norm -f on every record.
-// params.fasta is assigned by external/sarek/main.nf when it is included above.
-params.ref_fasta              = params.ref_fasta ?: params.fasta
+// Reference for consensus normalisation. Deliberately NOT defaulted here:
+// params.fasta is assigned by external/sarek/main.nf at include time and is not
+// reliably populated while this script-level params block runs (and an
+// externally-supplied null cannot be overwritten). Resolved instead by
+// resolveRefFasta() at the point of use, which errors clearly if unset.
+params.ref_fasta              = params.ref_fasta ?: null
 //params.vep_fasta              = params.vep_fasta ?: params.vep_fasta
 
 // Validate required parameters
@@ -67,6 +68,20 @@ params.ref_fasta              = params.ref_fasta ?: params.fasta
 
 def isGcsPath(path) {
     return path.toString().startsWith('gs://')
+}
+
+// Resolve the reference used for bcftools norm -f in the consensus subworkflow.
+// Must be the assembly the BAMs were aligned to (GATK, chr-prefixed contigs) --
+// NOT params.vep_fasta, which is the Ensembl build named 1/2/.../MT and fails on
+// every record. Called from inside a workflow body so params.fasta is populated.
+def resolveRefFasta() {
+    def f = params.ref_fasta ?: params.fasta
+    if (!f) {
+        error "❌ No reference genome for consensus normalisation. Set --ref_fasta " +
+              "to the GATK assembly the BAMs were aligned against (chr-prefixed), " +
+              "or ensure --genome/igenomes resolves params.fasta."
+    }
+    return f
 }
 
 def validateBedFile() {
@@ -232,8 +247,9 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
                 }
             
             // Create reference channels
-            ref_fasta_ch = Channel.value(file(params.ref_fasta))
-            ref_fai_ch = Channel.value(file(params.ref_fasta + ".fai"))
+            def _refFasta = resolveRefFasta()
+            ref_fasta_ch = Channel.value(file(_refFasta))
+            ref_fai_ch = Channel.value(file(_refFasta + ".fai"))
             
             // Run consensus calling
             CONSENSUS_CALLING(dv_vcf_ch, hc_vcf_ch, ref_fasta_ch, ref_fai_ch)
@@ -431,8 +447,9 @@ workflow RUN_FULL_VARIANT_CALLING {
                 .filter { vcf -> vcf.name.endsWith('.vcf.gz') && !vcf.name.endsWith('.tbi') }
                 .map { vcf -> tuple(vcf.parent.name, vcf) }
         } else if (params.create_consensus) {
-            ref_fasta_ch = Channel.value(file(params.ref_fasta))
-            ref_fai_ch   = Channel.value(file(params.ref_fasta + ".fai"))
+            def _refFasta = resolveRefFasta()
+            ref_fasta_ch = Channel.value(file(_refFasta))
+            ref_fai_ch   = Channel.value(file(_refFasta + ".fai"))
 
             CONSENSUS_CALLING(
                 COLLECT_VARIANT_CALLING_OUTPUTS.out.dv_vcf,
