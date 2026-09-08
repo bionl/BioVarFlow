@@ -10,6 +10,13 @@ params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/templ
 params.run_vep     = params.run_vep     ?: true
 params.min_dp   = params.min_dp   ?: 10
 params.min_qual = params.min_qual ?: 10
+
+// Reference used by NormalizeVCF for left-alignment/trimming: see the lazy
+// fallback inside POST_SAREK. Deliberately NOT resolved here at module script
+// level -- params.fasta is assigned in external/sarek/main.nf and its value
+// depends on include order, so it would be null if this module loaded first.
+// Override with --norm_fasta to use a local/GCS mirror and avoid igenomes egress.
+params.norm_fasta  = params.norm_fasta  ?: null
 // VEP resource params expected from main/config:
 // params.vep_fasta, params.revel_vcf, params.alpha_missense_vcf, params.clinvar_vcf
 
@@ -36,12 +43,27 @@ process NormalizeVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
   input:
     tuple val(meta), path(vcf)
+    path fasta
+    path fai
   output:
     tuple val(meta), path("${meta.sample}.normalized.vcf.gz")
   script:
     def sample = meta.sample
   """
-  bcftools norm -m -any $vcf -Oz -o ${sample}.normalized.vcf.gz
+  # -m -any  splits multiallelic sites into one record per ALT allele.
+  # -f       left-aligns indels and trims shared flanking bases. Without it,
+  #          alleles stay non-parsimonious (e.g. TAA>GAA instead of T>G), which
+  #          breaks position-keyed annotation lookups -- SpliceAI silently
+  #          returns nothing for the affected records.
+  #
+  # The reference MUST be the one the BAMs were aligned to (GATK
+  # Homo_sapiens_assembly38.fasta, chr-prefixed contigs). Passing the Ensembl
+  # VEP fasta here fails on every record: its contigs are named 1/2/.../MT.
+  #
+  # No -c override: bcftools exits on a REF mismatch by default, which is what
+  # we want -- a mismatch means the wrong reference, and continuing would
+  # silently corrupt allele representations.
+  bcftools norm -m -any -f $fasta $vcf -Oz -o ${sample}.normalized.vcf.gz
   tabix -p vcf ${sample}.normalized.vcf.gz
   """
 }
@@ -244,12 +266,22 @@ process CoverageGapsAnnotation {
     | bedtools sort -i - \
     | bedtools merge -i - > ${sample}.acmg_gaps_lt30.bed
 
-  bedtools intersect -wao -a ${sample}.acmg_gaps_lt20.bed -b $bed \
-    | awk 'BEGIN{OFS="\\t"}{ label = (\$7 != "" && \$7 != ".") ? \$7 : \$4 ":" \$5 "-" \$6; print \$1,\$2,\$3,label}' \
+  # Label each gap by the EXON it falls in (chrom:start-end from the -b BED),
+  # not by the BED's 4th column. That column is GENE|TRANSCRIPT and repeats
+  # across every exon of a gene, so using it collapsed all gaps to gene level
+  # and stamped one gene-wide total onto every exon row of the report.
+  #
+  # Also CLIP each gap to the exon: bedtools merge upstream can join adjacent
+  # low-coverage runs that span introns, so an unclipped gap routinely reported
+  # more bp than the exon it was attached to.
+  #   -a cols: \$1,\$2,\$3 = gap    -b cols: \$4,\$5,\$6 = exon, \$7 = GENE|TRANSCRIPT
+  # -wo (not -wao) emits only genuinely overlapping pairs.
+  bedtools intersect -wo -a ${sample}.acmg_gaps_lt20.bed -b $bed \
+    | awk 'BEGIN{OFS="\\t"}{ s=(\$2>\$5?\$2:\$5); e=(\$3<\$6?\$3:\$6); if(e>s) print \$1,s,e,\$4":"\$5"-"\$6 }' \
     > ${sample}.acmg_gaps_lt20.annot.bed
 
-  bedtools intersect -wao -a ${sample}.acmg_gaps_lt30.bed -b $bed \
-    | awk 'BEGIN{OFS="\\t"}{ label = (\$7 != "" && \$7 != ".") ? \$7 : \$4 ":" \$5 "-" \$6; print \$1,\$2,\$3,label}' \
+  bedtools intersect -wo -a ${sample}.acmg_gaps_lt30.bed -b $bed \
+    | awk 'BEGIN{OFS="\\t"}{ s=(\$2>\$5?\$2:\$5); e=(\$3<\$6?\$3:\$6); if(e>s) print \$1,s,e,\$4":"\$5"-"\$6 }' \
     > ${sample}.acmg_gaps_lt30.annot.bed
   """
 }
@@ -448,7 +480,23 @@ workflow POST_SAREK {
     template_dir_ch = Channel.fromPath("${params.template_dir}", type: 'dir').first()
     // VCF path
     BedFilterVCF(sample_inputs.map { s, vcf, bam, bai -> tuple(s, vcf) }, bed_ch)
-    NormalizeVCF(BedFilterVCF.out)
+    // Resolved here, not at module load: params.fasta is set by
+    // external/sarek/main.nf when it is included, and the igenomes map is the
+    // reliable fallback since config-parse time always populates it.
+    def _normFasta = params.norm_fasta ?: params.fasta
+    if (!_normFasta && params.genomes && params.genome && params.genomes.containsKey(params.genome)) {
+        _normFasta = params.genomes[params.genome].fasta
+    }
+    if (!_normFasta) {
+        error "❌ No reference for NormalizeVCF.\n" +
+              "   Tried --norm_fasta, params.fasta, params.genomes[${params.genome}].fasta.\n" +
+              "   genome=${params.genome}  genomes_loaded=${params.genomes ? params.genomes.size() : 0}\n" +
+              "   Set --norm_fasta to the GATK assembly the BAMs were aligned against."
+    }
+    norm_fasta_ch = Channel.value(file(_normFasta))
+    norm_fai_ch   = Channel.value(file("${_normFasta}.fai"))
+
+    NormalizeVCF(BedFilterVCF.out, norm_fasta_ch, norm_fai_ch)
     FilterVCF(NormalizeVCF.out)
     AddVAF(FilterVCF.out)
     vep_ch = params.run_vep ? VEP_Annotate(

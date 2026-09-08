@@ -40,7 +40,12 @@ params.run_db_qc              = params.run_db_qc instanceof Boolean ? params.run
 // downstream DB ingestion pipeline). Falls back to workflow.runName at
 // manifest-build time if left null.
 params.run_id                 = params.run_id ?: null
-params.ref_fasta              = params.ref_fasta ?: params.vep_fasta
+// Reference for consensus normalisation. Deliberately NOT defaulted here:
+// params.fasta is assigned by external/sarek/main.nf at include time and is not
+// reliably populated while this script-level params block runs (and an
+// externally-supplied null cannot be overwritten). Resolved instead by
+// resolveRefFasta() at the point of use, which errors clearly if unset.
+params.ref_fasta              = params.ref_fasta ?: null
 //params.vep_fasta              = params.vep_fasta ?: params.vep_fasta
 
 // Validate required parameters
@@ -64,6 +69,33 @@ params.ref_fasta              = params.ref_fasta ?: params.vep_fasta
 
 def isGcsPath(path) {
     return path.toString().startsWith('gs://')
+}
+
+// Resolve the reference used for bcftools norm -f in the consensus subworkflow.
+// Must be the assembly the BAMs were aligned to (GATK, chr-prefixed contigs) --
+// NOT params.vep_fasta, which is the Ensembl build named 1/2/.../MT and fails on
+// every record. Called from inside a workflow body so params.fasta is populated.
+//
+// Fallback chain, most-explicit first:
+//   1. --ref_fasta                   explicit override
+//   2. params.fasta                  set by external/sarek/main.nf; not reliably
+//                                    visible from this binding, never relied on alone
+//   3. params.genomes[genome].fasta  the igenomes map, loaded via includeConfig
+//                                    at config-parse time and always available here
+def resolveRefFasta() {
+    def f = params.ref_fasta ?: params.fasta
+    if (!f && params.genomes && params.genome && params.genomes.containsKey(params.genome)) {
+        f = params.genomes[params.genome].fasta
+    }
+    if (!f) {
+        error "❌ No reference genome for consensus normalisation.\n" +
+              "   Tried --ref_fasta, params.fasta, and params.genomes[${params.genome}].fasta.\n" +
+              "   genome=${params.genome}  igenomes_ignore=${params.igenomes_ignore}  " +
+              "genomes_loaded=${params.genomes ? params.genomes.size() : 0}\n" +
+              "   Set --ref_fasta to the GATK assembly the BAMs were aligned against " +
+              "(chr-prefixed contigs)."
+    }
+    return f
 }
 
 def validateBedFile() {
@@ -229,8 +261,9 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
                 }
             
             // Create reference channels
-            ref_fasta_ch = Channel.value(file(params.ref_fasta))
-            ref_fai_ch = Channel.value(file(params.ref_fasta + ".fai"))
+            def _refFasta = resolveRefFasta()
+            ref_fasta_ch = Channel.value(file(_refFasta))
+            ref_fai_ch = Channel.value(file(_refFasta + ".fai"))
             
             // Run consensus calling
             CONSENSUS_CALLING(dv_vcf_ch, hc_vcf_ch, ref_fasta_ch, ref_fai_ch)
@@ -432,8 +465,9 @@ workflow RUN_FULL_VARIANT_CALLING {
             MUTECT2_RESCUE(mutect2_vcf_ch, rescue_script_ch)
             final_vcf_ch = MUTECT2_RESCUE.out.map { sample, vcf, tbi -> tuple(sample, vcf) }
         } else if (params.create_consensus) {
-            ref_fasta_ch = Channel.value(file(params.ref_fasta))
-            ref_fai_ch   = Channel.value(file(params.ref_fasta + ".fai"))
+            def _refFasta = resolveRefFasta()
+            ref_fasta_ch = Channel.value(file(_refFasta))
+            ref_fai_ch   = Channel.value(file(_refFasta + ".fai"))
 
             CONSENSUS_CALLING(
                 COLLECT_VARIANT_CALLING_OUTPUTS.out.dv_vcf,
