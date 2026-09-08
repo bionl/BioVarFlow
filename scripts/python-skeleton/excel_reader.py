@@ -5,7 +5,7 @@ Handles reading and processing Excel files for the ACMG SF Variants Report.
 Maps Excel data to template variables according to the data mapping guide.
 
 BioVarFlow_HemOnc branch: also handles the optional HemOnc sheets
-('HemOnc (P-LP)', 'HemOnc Coverage gaps', 'HemOnc Genes Coverage') written
+('HemOnc (Reportable)', 'HemOnc Coverage gaps', 'HemOnc Genes Coverage') written
 by generate_lean_report_org.py when --hemonc-genes is supplied.
 """
 
@@ -22,12 +22,12 @@ class ExcelDataReader:
         self.debug = debug
         self.required_tabs = {
             'Sample Summary': True,
-            'ACMG SF (P-LP)': True,
+            'ACMG SF (Reportable)': True,
             'Coverage gaps': False,  # Optional
             'ACMG Genes Coverage': False,  # Optional
             # HemOnc sheets — optional; present only on runs that supplied
             # --hemonc-genes to the lean-report script.
-            'HemOnc (P-LP)': False,
+            'HemOnc (Reportable)': False,
             'HemOnc Coverage gaps': False,
             'HemOnc Genes Coverage': False,
         }
@@ -53,7 +53,7 @@ class ExcelDataReader:
             # Special handling for ClinVar_Link column to extract URLs from
             # HYPERLINK formulas. Applied to every variants sheet that carries
             # such formulas (ACMG SF and, on the HemOnc branch, HemOnc too).
-            for variants_sheet in ('ACMG SF (P-LP)', 'HemOnc (P-LP)'):
+            for variants_sheet in ('ACMG SF (Reportable)', 'HemOnc (Reportable)'):
                 if variants_sheet in excel_data:
                     excel_data[variants_sheet] = self._extract_hyperlinks(
                         self.excel_path,
@@ -121,7 +121,7 @@ class ExcelDataReader:
         """Validate that required columns exist in each tab"""
         validations = {
             'Sample Summary': ['Sample_ID'],  # Add other required columns
-            'ACMG SF (P-LP)': ['Gene', 'HGVSc', 'HGVSp', 'ClinVar'],
+            'ACMG SF (Reportable)': ['Gene', 'HGVSc', 'HGVSp', 'ClinVar'],
         }
 
         for tab_name, required_columns in validations.items():
@@ -198,13 +198,13 @@ class ExcelDataReader:
 
     def _process_variant_data(self, data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         """Extract and filter variant data for Page 1 and 2"""
-        if 'ACMG SF (P-LP)' not in data:
+        if 'ACMG SF (Reportable)' not in data:
             return {
                 'page1_variants': [],
                 'page2_variants': []
             }
 
-        df = data['ACMG SF (P-LP)']
+        df = data['ACMG SF (Reportable)']
         # Filter for pathogenic/likely pathogenic variants
         pathogenic_mask = df['ClinVar'].isin(['Pathogenic', 'Likely pathogenic','Conflicting_classifications_of_pathogenicity'])
         pathogenic_variants = df[pathogenic_mask]
@@ -383,9 +383,9 @@ class ExcelDataReader:
         }
 
         # ---- variants (mirrors _process_variant_data's ACMG logic) ----
-        if 'HemOnc (P-LP)' in data:
+        if 'HemOnc (Reportable)' in data:
             result['hemonc_available'] = True
-            df = data['HemOnc (P-LP)']
+            df = data['HemOnc (Reportable)']
             if 'ClinVar' in df.columns and len(df) > 0:
                 pathogenic_mask = df['ClinVar'].isin([
                     'Pathogenic',

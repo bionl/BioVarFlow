@@ -56,7 +56,7 @@ FILE_PATTERNS = {
     "excel_pattern": "{sample_id}_variants_lean_v1.xlsx",
     "csv_patterns": {
         "sample_summary": "Sample Summary-Table 1.csv",
-        "variants": "ACMG SF (P-LP)-Table 1.csv",
+        "variants": "ACMG SF (Reportable)-Table 1.csv",
         "coverage": "ACMG Genes Coverage-Table 1.csv",
         "coverage_gaps": "Coverage gaps-Table 1.csv",
         "pass_variants": "PASS variants-Table 1.csv"

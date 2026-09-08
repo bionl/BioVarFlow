@@ -104,7 +104,7 @@ def validate_sample_data():
 
     required_files = [
         "Sample Summary-Table 1.csv",
-        "ACMG SF (P-LP)-Table 1.csv",
+        "ACMG SF (Reportable)-Table 1.csv",
         "ACMG Genes Coverage-Table 1.csv",
         "Coverage gaps-Table 1.csv",
         "PASS variants-Table 1.csv"

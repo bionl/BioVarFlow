@@ -28,7 +28,7 @@ p.add_argument("--sexcheck", default=None, help="file with inferred sex (one lin
 p.add_argument("--sf-genes", default=None, help="ACMG SF gene list (one gene SYMBOL per line)")
 p.add_argument("--hemonc-genes", default=None,
                help="HemOnc gene list (one gene SYMBOL per line). "
-                    "When provided, three extra sheets are written: 'HemOnc (P-LP)', "
+                    "When provided, three extra sheets are written: 'HemOnc (Reportable)', "
                     "'HemOnc Coverage gaps', 'HemOnc Genes Coverage'.")
 p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
@@ -570,10 +570,16 @@ def is_benign_clinvar(clinvar_val):
     e.g. "Conflicting_classifications_of_pathogenicity" -- are not treated as
     benign and stay in the sheet.
 
-    Star rating is intentionally NOT considered here. Gating the exclusion on
-    ClinVar_Stars >= 2 would let ~80% of benign calls back in (most sit at 0-1
-    stars), while gating on stars alone would delete high-confidence PATHOGENIC
-    findings, which are the most reportable variants in the panel.
+    This tests the CLASSIFICATION only. The review-star threshold is applied by
+    the caller, which drops a variant only when this returns True AND
+    ClinVar_Stars >= 2 — i.e. only confidently-benign calls are excluded.
+    Benign entries with 0–1 stars are retained, on the basis that a single
+    unreviewed submitter is not strong enough evidence to hide a variant inside
+    a curated panel.
+
+    The star test must never be applied on its own: >= 2 stars alone would
+    delete high-confidence PATHOGENIC findings, the most reportable variants
+    in the panel.
     """
     if not clinvar_val:
         return False
@@ -1044,13 +1050,21 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         variants["ClinVar_URL"] = variants.apply(clinvar_url_from_row, axis=1)
         variants["ClinVar_Link"] = variants["ClinVar_URL"].map(make_hyperlink)
         # Exclusion, not inclusion: inside a curated gene panel we report
-        # everything ClinVar has NOT called benign — so pathogenic, likely
-        # pathogenic, conflicting, VUS, and variants with no ClinVar entry all
-        # stay. Only an explicit Benign / Likely_benign classification drops a
-        # variant. See is_benign_clinvar() for why star rating is not part of
-        # this decision.
+        # everything except what ClinVar has CONFIDENTLY called benign —
+        # i.e. Benign / Likely_benign carrying >= 2 review stars. Retained:
+        # pathogenic, likely pathogenic, conflicting, VUS, benign with 0–1
+        # stars, and variants with no ClinVar entry at all.
+        #
+        # The star gate qualifies the benign exclusion only. Testing stars
+        # alone would delete high-confidence PATHOGENIC calls. Missing/
+        # unparseable star values count as 0, so an unrated benign entry is
+        # kept rather than silently dropped.
         if "ClinVar" in variants.columns:
-            variants = variants[~variants["ClinVar"].map(is_benign_clinvar)]
+            _benign = variants["ClinVar"].map(is_benign_clinvar)
+            _stars = pd.to_numeric(
+                variants["ClinVar_Stars"], errors="coerce"
+            ).fillna(0) if "ClinVar_Stars" in variants.columns else 0
+            variants = variants[~(_benign & (_stars >= 2))]
         if gene_set:
             variants = variants[variants["Gene"].isin(gene_set)]
         variants[variant_cols].to_excel(xw, index=False, sheet_name=variants_sheet)
@@ -1108,7 +1122,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     # backwards compatibility with the HTML report reader).
     write_gene_set_sheets(
         gene_set=sf_genes,
-        variants_sheet="ACMG SF (P-LP)",
+        variants_sheet="ACMG SF (Reportable)",
         gaps_sheet="Coverage gaps",
         genes_cov_sheet="ACMG SF Genes Coverage",
     )
@@ -1118,7 +1132,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     if hemonc_genes:
         write_gene_set_sheets(
             gene_set=hemonc_genes,
-            variants_sheet="HemOnc (P-LP)",
+            variants_sheet="HemOnc (Reportable)",
             gaps_sheet="HemOnc Coverage gaps",
             genes_cov_sheet="HemOnc Genes Coverage",
         )
