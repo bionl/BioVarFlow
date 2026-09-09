@@ -6,8 +6,28 @@ Maps Excel data to template variables according to the data mapping guide.
 """
 
 import pandas as pd
+import re
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+
+
+def _is_pathogenic_clinvar(clinvar_val):
+    """
+    True only for an exact Pathogenic / Likely_pathogenic classification,
+    including combined forms ("Pathogenic/Likely_pathogenic").
+
+    Deliberately exact-token: "Conflicting_classifications_of_pathogenicity"
+    contains the word but is NOT a pathogenic assertion. Used to decide page 1
+    membership, so that page only carries findings ClinVar actually calls
+    (likely) pathogenic.
+    """
+    if clinvar_val is None or (isinstance(clinvar_val, float) and pd.isna(clinvar_val)):
+        return False
+    exact = {"pathogenic", "likely pathogenic"}
+    for tok in re.split(r"[&/|,]", str(clinvar_val)):
+        if tok.strip().lower().replace("_", " ") in exact:
+            return True
+    return False
 
 
 class ExcelDataReader:
@@ -187,10 +207,12 @@ class ExcelDataReader:
             }
 
         df = data['ACMG SF (P-LP)']
-        pathogenic_mask = df['ClinVar'].astype(str).str.contains(
-            'pathogenic', case=False, na=False
-        )
-        pathogenic_variants = df[pathogenic_mask]
+
+        # No pathogenicity filter here: generate_lean_report_org.py already
+        # applied the identical contains("pathogenic") test when building this
+        # sheet, so re-filtering is redundant and risks the two tests drifting
+        # apart. Render every row the sheet contains.
+        pathogenic_variants = df
 
         # Split based on star rating (>=2 stars for Page 1, <2 stars for Page 2)
         page1_variants = []
@@ -226,7 +248,10 @@ class ExcelDataReader:
             except (ValueError, TypeError):
                 stars = 0
 
-            if stars >= 2:
+            # Page 1 = confidently reviewed AND actually (likely) pathogenic.
+            # Stars alone would place a >=2-star "Conflicting classifications"
+            # variant under a heading reading "possible clinical relevance".
+            if stars >= 2 and _is_pathogenic_clinvar(row.get('ClinVar')):
                 page1_variants.append(variant_data)
             else:
                 page2_variants.append(variant_data)
