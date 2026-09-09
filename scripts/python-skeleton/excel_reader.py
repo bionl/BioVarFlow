@@ -10,8 +10,28 @@ by generate_lean_report_org.py when --hemonc-genes is supplied.
 """
 
 import pandas as pd
+import re
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+
+
+def _is_pathogenic_clinvar(clinvar_val):
+    """
+    True only for an exact Pathogenic / Likely_pathogenic classification,
+    including combined forms ("Pathogenic/Likely_pathogenic").
+
+    Deliberately exact-token: "Conflicting_classifications_of_pathogenicity"
+    contains the word but is NOT a pathogenic assertion, and a well-reviewed
+    VUS is not one either. Used to decide page 1 membership, so that page only
+    carries findings ClinVar actually calls (likely) pathogenic.
+    """
+    if clinvar_val is None or (isinstance(clinvar_val, float) and pd.isna(clinvar_val)):
+        return False
+    exact = {"pathogenic", "likely pathogenic"}
+    for tok in re.split(r"[&/|,]", str(clinvar_val)):
+        if tok.strip().lower().replace("_", " ") in exact:
+            return True
+    return False
 
 
 class ExcelDataReader:
@@ -205,9 +225,21 @@ class ExcelDataReader:
             }
 
         df = data['ACMG SF (Reportable)']
-        # Filter for pathogenic/likely pathogenic variants
-        pathogenic_mask = df['ClinVar'].isin(['Pathogenic', 'Likely pathogenic','Conflicting_classifications_of_pathogenicity'])
-        pathogenic_variants = df[pathogenic_mask]
+
+        # NO pathogenicity filter here. The sheet already defines membership --
+        # generate_lean_report_org.py excluded only confidently-benign calls
+        # (Benign/Likely_benign with >= 2 stars) and kept everything else,
+        # including VUS and variants with no ClinVar entry.
+        #
+        # Re-filtering on "pathogenic" would undo that: it silently dropped VUS
+        # and unannotated variants, and an earlier exact isin() list also lost
+        # every "Likely_pathogenic" (ClinVar writes it with an underscore, the
+        # list had a space) -- so the sample's only expert-panel-reviewed
+        # finding was absent from the report entirely.
+        #
+        # Render every row the sheet contains; the >= 2-star split below is what
+        # separates confident calls from those needing further review.
+        pathogenic_variants = df
 
         # Split based on star rating (>=2 stars for Page 1, <2 stars for Page 2)
         page1_variants = []
@@ -244,7 +276,11 @@ class ExcelDataReader:
             except (ValueError, TypeError):
                 stars = 0
 
-            if stars >= 2:
+            # Page 1 = confidently reviewed AND actually (likely) pathogenic.
+            # The star test alone would put a 3-star VUS under a heading that
+            # reads "possible clinical relevance"; the classification test alone
+            # would admit single-submitter assertions. Both must hold.
+            if stars >= 2 and _is_pathogenic_clinvar(row.get('ClinVar')):
                 page1_variants.append(variant_data)
             else:
                 page2_variants.append(variant_data)
@@ -387,12 +423,9 @@ class ExcelDataReader:
             result['hemonc_available'] = True
             df = data['HemOnc (Reportable)']
             if 'ClinVar' in df.columns and len(df) > 0:
-                pathogenic_mask = df['ClinVar'].isin([
-                    'Pathogenic',
-                    'Likely pathogenic',
-                    'Conflicting_classifications_of_pathogenicity',
-                ])
-                pathogenic_variants = df[pathogenic_mask]
+                # No pathogenicity filter -- the sheet already defines
+                # membership. See the ACMG SF block above.
+                pathogenic_variants = df
 
                 for _, row in pathogenic_variants.iterrows():
                     clinvar_id = row.get('ClinVar_Link', '')
@@ -423,7 +456,9 @@ class ExcelDataReader:
                     except (ValueError, TypeError):
                         stars = 0
 
-                    if stars >= 2:
+                    # Same rule as the ACMG SF pages above: >= 2 stars AND an
+                    # actual (likely) pathogenic classification.
+                    if stars >= 2 and _is_pathogenic_clinvar(row.get('ClinVar')):
                         result['hemonc_page1_variants'].append(variant_data)
                     else:
                         result['hemonc_page2_variants'].append(variant_data)
