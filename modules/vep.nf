@@ -2,7 +2,7 @@
 nextflow.enable.dsl=2
 
 // -------- Parameters (used by processes) --------
-params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_plus_KHCC_MANE_exons_50bp.bed"
+params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_plus_HemOnc_MANE_exons_50bp.refseq.bed"
 params.sf_genes    = params.sf_genes    ?: "${workflow.projectDir}/data/acmg_sf_gene_list.txt"
 params.hemonc_genes= params.hemonc_genes?: "${workflow.projectDir}/data/hemonc.txt"
 params.outdir      = params.outdir      ?: "results"
@@ -363,6 +363,67 @@ process SexCheck {
   """
 }
 
+// ── Per-variant, per-allele strand bias from the RAW alignment ──────────────
+//
+// The existing strand QC (ForwardReverseRatio) is per-EXON and counts every
+// read regardless of allele, so it cannot see a skew confined to the alt reads.
+// GATK's INFO/FS can, but it is computed on post-reassembly allele depths: for
+// MSH2 chr2:47414420 T>G it reported FS=43.4 (under the standard >60 filter)
+// while the raw pileup showed 0 forward / 11 reverse alt reads against 49/8
+// reference -- Fisher p = 4.9e-08, i.e. FS ~73.
+//
+// bcftools mpileup recomputes allele depths from the alignment itself. ADF/ADR
+// are the per-allele forward/reverse counts, giving the 2x2 table directly, and
+// unlike a plain samtools pileup they cover indels as well as SNVs. --no-BAQ
+// keeps indel-adjacent bases from being down-weighted.
+process StrandBiasPileup {
+  tag { "${meta.sample} (${meta.assay})" }
+  input:
+    tuple val(meta), path(vcf), path(bam), path(bai)
+    path fasta
+    path fai
+  output:
+    tuple val(meta), path("${meta.sample}_mpileup_adf_adr.tsv")
+  script:
+    def sample = meta.sample
+  """
+  set -euo pipefail
+  tabix -f -p vcf $vcf 2>/dev/null || bcftools index -f -t $vcf
+
+  bcftools query -f '%CHROM\\t%POS\\n' $vcf > sites.txt
+
+  bcftools mpileup \\
+    --targets-file sites.txt \\
+    --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \\
+    --fasta-ref $fasta \\
+    --min-BQ 13 --min-MQ 0 --no-BAQ --max-depth 8000 \\
+    -Ou $bam \\
+  | bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%ADF\\t%ADR]\\n' \\
+  > ${sample}_mpileup_adf_adr.tsv
+  """
+}
+
+// Fisher test over the pileup counts. Split from StrandBiasPileup only because
+// of containers: the bcftools biocontainer has no python3, and this half runs in
+// the same python-bionl image as the other report scripts.
+process StrandBiasTest {
+  tag { "${meta.sample} (${meta.assay})" }
+  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
+  input:
+    tuple val(meta), path(pileup), path(vcf)
+    each path(script)
+  output:
+    tuple val(meta), path("${meta.sample}_strand_bias.tsv")
+  script:
+    def sample = meta.sample
+  """
+  python3 ${script} \\
+    --mpileup ${pileup} \\
+    --vcf $vcf \\
+    --out ${sample}_strand_bias.tsv
+  """
+}
+
 process BcftoolsStats {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
   publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
@@ -432,7 +493,8 @@ process LeanReport {
           path(mosdepth_summary),
           path(sex_check),
           path(gaps20), path(gaps30),
-          path(thresholds)
+          path(thresholds),
+          path(strand_bias)
     each path(script)
     each path(sf_genes_file)
     each path(hemonc_genes_file)
@@ -451,7 +513,8 @@ process LeanReport {
     --sexcheck ${sex_check} \
     --sf-genes ${sf_genes_file} \
     --hemonc-genes ${hemonc_genes_file} \
-    --gaps20 ${gaps20} --gaps30 ${gaps30}
+    --gaps20 ${gaps20} --gaps30 ${gaps30} \
+    --strand-bias ${strand_bias}
   """
 }
 
@@ -566,6 +629,14 @@ workflow POST_SAREK {
     SexCheck(bam_sample_ch.map { s, bam, bai -> tuple(s, bam) })
     BcftoolsStats(vep_ch.map { s, vcf -> tuple(s, vcf) })
 
+    // Per-variant strand bias, recomputed from the raw alignment (see the
+    // StrandBiasPileup header for why the caller's own FS is not enough).
+    strand_bias_script_ch = Channel.fromPath("${params.scriptdir}/strand_bias.py").first()
+    StrandBiasPileup(
+      vep_ch.join(bam_sample_ch).map { s, vcf, bam, bai -> tuple(s, vcf, bam, bai) },
+      norm_fasta_ch, norm_fai_ch)
+    StrandBiasTest(StrandBiasPileup.out.join(vep_ch), strand_bias_script_ch)
+
     // prepare joins keyed by sample
     exon_cov_ch         = CoverageSummary.out.map { s, summary, per_base -> tuple(s, summary) }
     gaps20_ch           = CoverageGapsAnnotation.out.map { s, g20, g30, a20, a30 -> tuple(s, a20) }
@@ -585,6 +656,7 @@ workflow POST_SAREK {
       .join(gaps20_ch)
       .join(gaps30_ch)
       .join(thresholds_ch)
+      .join(StrandBiasTest.out)
     LeanReport(lean_input_ch, script_ch, sf_genes_ch, hemonc_genes_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 }
