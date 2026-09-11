@@ -390,7 +390,10 @@ process StrandBiasPileup {
   set -euo pipefail
   # No index needed: VEP emits a plain uncompressed VCF, `query` streams it, and
   # --targets-file (unlike --regions-file) reads sequentially rather than seeking.
-  bcftools query -f '%CHROM\\t%POS\\n' $vcf > sites.txt
+  # uniq is required, not tidiness: a --targets-file must hold each position
+  # once, and a normalized VCF repeats POS for every ALT of a multiallelic site.
+  # The 4 duplicated positions in IQMM left 3 of them with no pileup output.
+  bcftools query -f '%CHROM\\t%POS\\n' $vcf | uniq > sites.txt
 
   bcftools mpileup \\
     --targets-file sites.txt \\

@@ -40,11 +40,15 @@ and a QC_Flags entry; nothing is filtered out, because a flagged variant may
 still be real and the decision (typically orthogonal confirmation) is the
 reviewer's.
 
-Caveat: the threshold was calibrated on SNVs. Indels (~95/sample) carry more
-pileup noise; treat an indel flag as weaker evidence than a SNV flag.
+Scope: SNVs only. mpileup realigns gaps with its own model and does not
+reproduce the caller's indel alleles -- on IQMM, 12 of the 14 largest
+pileup-vs-caller VAF disagreements were indels (ACTC1 TCACA>T read 0.24 against
+the caller's 1.00). Indels are reported as NA rather than given a p-value that
+would look like evidence.
 """
 
 import argparse
+import collections
 import gzip
 import math
 import sys
@@ -105,12 +109,18 @@ def read_vcf_variants(path):
 
 
 def parse_mpileup(path):
-    """{(chrom, pos): (ref, [alts], [adf], [adr])} from the query TSV.
+    """{(chrom, pos): [(ref, [alts], [adf], [adr]), ...]} from the query TSV.
 
     Columns are CHROM POS REF ALT ADF ADR, with ADF/ADR comma-separated in
     allele order (reference first, then each ALT, including mpileup's <*>).
+
+    A position maps to a LIST, not a single record: bcftools mpileup emits the
+    SNV and the indel at a site as separate lines sharing the same POS. Keying
+    one record per position dropped whichever came first -- at MSH2
+    chr2:47414420, which carries both a T>G SNV and a TAA>T deletion, that left
+    both VCF rows untested.
     """
-    table = {}
+    table = collections.defaultdict(list)
     with open(path) as fh:
         for line in fh:
             f = line.rstrip("\n").split("\t")
@@ -121,35 +131,21 @@ def parse_mpileup(path):
             def nums(s):
                 return [int(x) if x.isdigit() else 0 for x in s.split(",")]
 
-            table[(chrom, pos)] = (ref, alt.split(","), nums(adf), nums(adr))
+            table[(chrom, pos)].append((ref, alt.split(","), nums(adf), nums(adr)))
     return table
 
 
 def match_allele(v_ref, v_alt, m_ref, m_alts):
     """Index into mpileup's allele list (0 = reference) for this VCF ALT.
 
-    SNVs match on the alt base. Indels are matched on net length change and,
-    where the sequences are comparable, on the inserted/deleted bases — mpileup
-    and the VCF can pad an indel differently even when both are left-aligned.
+    SNVs only -- indels are filtered out before this is called, because
+    mpileup's gap realignment does not reproduce the caller's indel alleles.
     """
-    v_delta = len(v_alt) - len(v_ref)
-
-    if v_delta == 0 and len(v_ref) == 1:
-        for i, a in enumerate(m_alts):
-            if a == v_alt:
-                return i + 1
+    if len(v_ref) != 1 or len(v_alt) != 1 or len(m_ref) != 1:
         return None
-
     for i, a in enumerate(m_alts):
-        if a == "<*>":
-            continue
-        if len(a) - len(m_ref) != v_delta:
-            continue
-        # Compare the changed segment rather than the whole padded allele.
-        if v_delta > 0 and a[len(m_ref):] and v_alt[len(v_ref):]:
-            if a[len(m_ref):] != v_alt[len(v_ref):]:
-                continue
-        return i + 1
+        if a == v_alt:
+            return i + 1
     return None
 
 
@@ -167,26 +163,42 @@ def main():
     mp = parse_mpileup(args.mpileup)
     variants = read_vcf_variants(args.vcf)
 
-    flagged = unmatched = 0
+    flagged = unmatched = skipped_indel = 0
     with open(args.out, "w") as out:
         out.write("CHROM\tPOS\tREF\tALT\tREF_FWD\tREF_REV\tALT_FWD\tALT_REV\t"
                   "ALT_FWD_FRAC\tStrandBias_P\tStrandBias_Flag\n")
         for chrom, pos, ref, alt in variants:
-            rec = mp.get((chrom, pos))
-            idx = match_allele(ref, alt, rec[0], rec[1]) if rec else None
-            if rec is None or idx is None:
+            na = f"{chrom}\t{pos}\t{ref}\t{alt}\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n"
+
+            # Indels are not tested. bcftools mpileup realigns gaps with its own
+            # model and does not reproduce the caller's indel alleles: on IQMM,
+            # 12 of the 14 largest pileup-vs-caller VAF disagreements were
+            # indels, ACTC1 TCACA>T reading 0.24 against the caller's 1.00. A
+            # Fisher p on counts that far off the called allele is noise, and
+            # the p<1e-4 threshold was calibrated on SNVs only. Emitting NA says
+            # "not tested"; emitting a number would imply it had been.
+            if not (len(ref) == 1 and len(alt) == 1 and alt != "*"):
+                skipped_indel += 1
+                out.write(na)
+                continue
+
+            # A position can carry several mpileup records (SNV line + indel
+            # line); take the first whose alleles match this VCF row.
+            hit = None
+            for rec in mp.get((chrom, pos), ()):
+                idx = match_allele(ref, alt, rec[0], rec[1])
+                if idx is not None and idx < len(rec[2]) and idx < len(rec[3]):
+                    hit = (rec, idx)
+                    break
+            if hit is None:
                 # No pileup evidence to judge on: emit NA rather than a
                 # fabricated zero, so the report can tell "not tested" from
                 # "tested and clean".
                 unmatched += 1
-                out.write(f"{chrom}\t{pos}\t{ref}\t{alt}\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n")
+                out.write(na)
                 continue
-
+            rec, idx = hit
             _, _, adf, adr = rec
-            if idx >= len(adf) or idx >= len(adr):
-                unmatched += 1
-                out.write(f"{chrom}\t{pos}\t{ref}\t{alt}\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n")
-                continue
 
             rf, rr = adf[0], adr[0]
             af, ar = adf[idx], adr[idx]
@@ -205,7 +217,8 @@ def main():
     n = len(variants)
     pct = (100.0 * flagged / n) if n else 0.0
     print(f"strand_bias: {n} variants, {flagged} flagged ({pct:.1f}%) at "
-          f"p<{args.p_threshold:g}, {unmatched} without pileup support",
+          f"p<{args.p_threshold:g}, {unmatched} SNVs without pileup support, "
+          f"{skipped_indel} indels not tested",
           file=sys.stderr)
 
 
