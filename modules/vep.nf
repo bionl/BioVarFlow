@@ -388,8 +388,8 @@ process StrandBiasPileup {
     def sample = meta.sample
   """
   set -euo pipefail
-  tabix -f -p vcf $vcf 2>/dev/null || bcftools index -f -t $vcf
-
+  # No index needed: VEP emits a plain uncompressed VCF, `query` streams it, and
+  # --targets-file (unlike --regions-file) reads sequentially rather than seeking.
   bcftools query -f '%CHROM\\t%POS\\n' $vcf > sites.txt
 
   bcftools mpileup \\
