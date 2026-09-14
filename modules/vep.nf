@@ -390,11 +390,18 @@ process StrandBiasPileup {
   set -euo pipefail
   # No index needed: VEP emits a plain uncompressed VCF, `query` streams it, and
   # --targets-file (unlike --regions-file) reads sequentially rather than seeking.
+  #
   # uniq is required, not tidiness: a --targets-file must hold each position
   # once, and a normalized VCF repeats POS for every ALT of a multiallelic site.
-  # The 4 duplicated positions in IQMM left 3 of them with no pileup output.
   bcftools query -f '%CHROM\\t%POS\\n' $vcf | uniq > sites.txt
 
+  # Deliberately NOT `bcftools call -C alleles`. Constraining the pileup to the
+  # caller's alleles looks like the right way to fix indel counting, and it does
+  # match more indels -- but `call` makes a GENOTYPE decision, and when alt
+  # support is weak and one-sided it calls the site hom-ref and drops the ALT
+  # entirely. That is exactly the artifact class this check exists to find: on
+  # IQMM it returned ALT='.' for MSH2, RUNX1 and DSG2 alike and flagged nothing.
+  # Plain mpileup reports what it sees and lets the Fisher test decide.
   bcftools mpileup \\
     --targets-file sites.txt \\
     --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \\

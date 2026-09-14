@@ -34,6 +34,14 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--report-min-vaf", type=float, default=0.20,
+               help="Reportable sheets: drop variants below this VAF. Removes low-level "
+                    "artifacts, chiefly homopolymer-slippage indels, which the strand-bias "
+                    "check cannot assess. Set 0 to disable (see --help notes on CHIP).")
+p.add_argument("--report-max-af", type=float, default=0.01,
+               help="Reportable sheets: drop variants at or above this gnomAD AF unless "
+                    "ClinVar calls them Pathogenic/Likely_pathogenic (ACMG BA1/BS1). "
+                    "Set 1 to disable.")
 p.add_argument("--strand-bias", default=None,
                help="strand_bias.py TSV: per-variant ALT_FWD/ALT_REV and Fisher p from the raw alignment")
 
@@ -959,11 +967,27 @@ if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
     # FS is computed after local reassembly and can badly understate the skew:
     # MSH2 chr2:47414420 T>G had FS=43.4 (passing FS>60) but 0/14 forward alt
     # reads in the raw pileup, p=4.9e-08. Advisory only -- flagged, not dropped.
+    #
+    # StrandBias carries the OUTCOME in words, because three very different
+    # situations otherwise render identically in Excel as an empty cell or a
+    # high p-value:
+    #   PASS                    tested with enough reads to have found skew
+    #   UNDERPOWERED            too few alt reads for any split to reach the
+    #                           threshold -- absence of evidence, not evidence
+    #                           of absence (SEC23B chr20:18524919, 9 alt reads,
+    #                           best achievable p = 0.01)
+    #   NOT_TESTED_*            indel, or no usable pileup record
+    # A reviewer reading a blank cell as "no problem" is exactly the failure
+    # this check exists to prevent, so the status is never left implicit.
     df["ALT_FWD"] = pd.NA
     df["ALT_REV"] = pd.NA
     df["StrandBias_P"] = pd.NA
+    # NOT_RUN distinguishes "the check was never invoked" from "invoked and
+    # found nothing for this variant".
+    df["StrandBias"] = "NOT_RUN"
     _sb_flag = pd.Series(False, index=df.index)
     if args.strand_bias and os.path.exists(args.strand_bias):
+        df["StrandBias"] = "NOT_TESTED_NO_PILEUP"
         _sb = pd.read_csv(args.strand_bias, sep="\t", dtype=str)
         _sb = _sb.drop_duplicates(subset=["CHROM", "POS", "REF", "ALT"])
         _sb_idx = _sb.set_index(["CHROM", "POS", "REF", "ALT"])
@@ -976,6 +1000,7 @@ if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
             df.at[_i, "ALT_FWD"] = _row["ALT_FWD"]
             df.at[_i, "ALT_REV"] = _row["ALT_REV"]
             df.at[_i, "StrandBias_P"] = _row["StrandBias_P"]
+            df.at[_i, "StrandBias"] = _row["StrandBias_Flag"]
             _sb_flag.at[_i] = (_row["StrandBias_Flag"] == "STRAND_BIAS")
 
     _flags = []
@@ -993,7 +1018,7 @@ if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
         _flags.append(";".join(_f))
     df["QC_Flags"] = _flags
 
-for _c in ("QC_Flags", "ALT_FWD", "ALT_REV", "StrandBias_P", "Multiallelic"):
+for _c in ("QC_Flags", "ALT_FWD", "ALT_REV", "StrandBias_P", "StrandBias", "Multiallelic"):
     if _c not in df.columns:
         df[_c] = pd.NA
 
@@ -1059,7 +1084,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "Gene","Variant","HGVSc","HGVSp","MANE_ID","Zygosity","GT","AD_Ref","AD_Alt","DP","GQ","QUAL",
         "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
         # Raw-alignment strand bias: advisory, never a filter. See strand_bias.py.
-        "ALT_FWD","ALT_REV","StrandBias_P","QC_Flags"
+        "ALT_FWD","ALT_REV","StrandBias_P","StrandBias","QC_Flags"
     ]
     empty_gaps_cols = [
         "Gene","MANE_ID","Exon","RegionLabel","Chrom","ExonStart","ExonEnd","ExonLen",
@@ -1068,7 +1093,9 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "Gaps<30x_n","Gaps<30x_bp","Gaps<30x_intervals"
     ]
 
-    def write_gene_set_sheets(gene_set, variants_sheet, gaps_sheet, genes_cov_sheet):
+    def write_gene_set_sheets(gene_set, variants_sheet, gaps_sheet, genes_cov_sheet,
+                              report_min_vaf=args.report_min_vaf,
+                              report_max_af=args.report_max_af):
         """
         Emit three sheets to the open ExcelWriter `xw`, scoped to `gene_set`:
           1. `variants_sheet`   — ClinVar-pathogenic variants in genes of `gene_set`
@@ -1101,6 +1128,36 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
                 variants["ClinVar_Stars"], errors="coerce"
             ).fillna(0) if "ClinVar_Stars" in variants.columns else 0
             variants = variants[~(_benign & (_stars >= 2))]
+
+        # ---- VAF floor and population-frequency gate --------------------------
+        # The benign exclusion above is deliberately permissive, which left 167
+        # rows per case once the panel grew to 285 genes -- 117 of them common
+        # polymorphisms. These two gates cut that to ~29 without touching the
+        # "keep VUS and unannotated" principle.
+        #
+        # Both are ANDed, so the order they are applied in does not change the
+        # result. Pathogenic / Likely_pathogenic is exempt from BOTH: a
+        # pathogenic variant can be common in a founder population, and a
+        # mosaic one can sit below the VAF floor.
+        _plp = (variants["ClinVar"].map(is_pathogenic_clinvar)
+                if "ClinVar" in variants.columns else pd.Series(False, index=variants.index))
+
+        if report_min_vaf > 0:
+            # VAF recomputed from AD rather than read from FORMAT/VAF, which is
+            # still wrong at multiallelic sites (see the reconciliation pass).
+            _ar = pd.to_numeric(variants.get("AD_Ref"), errors="coerce")
+            _aa = pd.to_numeric(variants.get("AD_Alt"), errors="coerce")
+            _vaf = _aa / (_ar + _aa)
+            # NaN VAF (missing AD) is kept: absence of evidence is not evidence
+            # to drop a variant from a clinical sheet.
+            variants = variants[~((_vaf < report_min_vaf) & ~_plp) | _vaf.isna()]
+
+        if report_max_af < 1:
+            _af = pd.to_numeric(variants.get("gnomAD_AF"), errors="coerce")
+            _plp2 = _plp.reindex(variants.index, fill_value=False)
+            # Absent from gnomAD (NaN) means rare, so it is kept.
+            variants = variants[~((_af >= report_max_af) & ~_plp2)]
+
         if gene_set:
             variants = variants[variants["Gene"].isin(gene_set)]
         variants[variant_cols].to_excel(xw, index=False, sheet_name=variants_sheet)
@@ -1177,7 +1234,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     pass_cols = [
         "Variant","Gene","HGVSc","HGVSp","MANE_ID","Transcript","Consequence","GT","Zygosity","AD_Ref","AD_Alt","DP","GQ","QUAL",
         "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
-        "ALT_FWD","ALT_REV","StrandBias_P","QC_Flags"
+        "ALT_FWD","ALT_REV","StrandBias_P","StrandBias","QC_Flags"
     ]
     df_pass = df[df["FILTER"]=="PASS"].copy()
     df_pass[pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
