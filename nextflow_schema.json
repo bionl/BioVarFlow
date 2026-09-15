@@ -25,6 +25,14 @@
           "description": "Where to write results (local path or gs://).",
           "format": "directory-path"
         },
+        "phenotypes": {
+            "type": "string",
+            "title": "Phenotypes CSV (Exomiser)",
+            "description": "CSV of HPO terms per sample, used by Exomiser to rank variants genome-wide. Columns: sample,sex,hpo - sex is MALE / FEMALE / UNKNOWN_SEX, hpo is a semicolon-separated list of HPO IDs (e.g. IQMM,MALE,HP:0004808;HP:0002863). Exomiser is skipped for any sample not listed.",
+            "mimetype": "text/csv",
+            "format": "file-path",
+            "pattern": "^\\S*\\.csv$"
+        },
         "run_id": {
           "type": "string",
           "title": "Run identifier",

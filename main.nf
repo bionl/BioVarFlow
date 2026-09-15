@@ -16,6 +16,9 @@ include { POST_SAREK } \
 include { CONSENSUS_CALLING } \
   from './modules/consensus.nf'
 
+include { EXOMISER } \
+  from './modules/exomiser.nf'
+
 include { DB_QC_EXPORT } \
   from './modules/db_qc_export.nf'
 
@@ -452,6 +455,10 @@ workflow RUN_FULL_VARIANT_CALLING {
             params.outdir
         )
 
+        // Only the consensus branch produces one; declared up front so the
+        // somatic and DV-only branches leave a defined value.
+        raw_consensus_ch = null
+
         if (params.somatic_mode) {
             def isGCS = isGcsPath(params.outdir)
             final_vcf_ch = NFCORE_SAREK.out.multiqc_report
@@ -473,6 +480,10 @@ workflow RUN_FULL_VARIANT_CALLING {
             )
 
             final_vcf_ch = CONSENSUS_CALLING.out.consensus_vcf
+            // Exomiser ranks genome-wide, so it takes the UNFILTERED consensus.
+            // Everything downstream of here is panel-restricted and would hide
+            // exactly the off-panel findings Exomiser is run to surface.
+            raw_consensus_ch = CONSENSUS_CALLING.out.consensus_vcf_raw
         } else {
             final_vcf_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.dv_vcf
         }
@@ -534,6 +545,17 @@ workflow RUN_FULL_VARIANT_CALLING {
         // POST_SAREK (VEP annotation) is germline-only — skip in somatic mode
         if (!params.somatic_mode) {
             POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
+        }
+
+        if (params.run_exomiser) {
+            if (raw_consensus_ch == null) {
+                error "❌ --run_exomiser needs the consensus callset; run with --create_consensus."
+            }
+            EXOMISER(
+                raw_consensus_ch.map { sample, vcf, tbi ->
+                    tuple([ sample: sample, assay: assayMap.get(sample, 'NA') ], vcf, tbi)
+                }
+            )
         }
 }
 

@@ -326,4 +326,10 @@ workflow CONSENSUS_CALLING {
   
   emit:
     consensus_vcf = FilterConsensusVCF.out
+    // Unfiltered consensus, for Exomiser. The tiered DP/GQ/QUAL filter that
+    // produces consensus_vcf exists to make the reporting sheets trustworthy;
+    // Exomiser applies its own frequency and pathogenicity filters and ranks
+    // what survives, so handing it the pre-filter callset avoids dropping
+    // candidates before it ever sees them.
+    consensus_vcf_raw = BuildConsensusVCF.out
 }
