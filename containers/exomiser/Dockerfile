@@ -11,6 +11,13 @@
 # because the directory inside is arch-suffixed.
 FROM google/cloud-sdk:slim
 
+# procps supplies `ps`, which Nextflow's task wrapper calls to collect metrics.
+# google/cloud-sdk:slim omits it, and on the Google Batch executor the missing
+# binary fails the task outright rather than merely skipping the metrics.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends procps \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY --from=exomiser/exomiser-cli:15.1.0 /usr/lib/jvm /usr/lib/jvm
 COPY --from=exomiser/exomiser-cli:15.1.0 /app /app
 
