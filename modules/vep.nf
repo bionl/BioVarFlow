@@ -91,21 +91,6 @@ process FilterVCF {
   """
 }
 
-process AddVAF {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
-  publishDir "${params.outdir}/${meta.sample}/vcf", mode: 'copy'
-  input:
-    tuple val(meta), path(vcf)
-  output:
-    tuple val(meta), path("${meta.sample}.vaf_added.vcf.gz")
-  script:
-    def sample = meta.sample
-  """
-  bcftools +fill-tags $vcf -Oz -o ${sample}.vaf_added.vcf.gz -- -t FORMAT/VAF
-  tabix -p vcf ${sample}.vaf_added.vcf.gz
-  """
-}
-
 process BedFilterBAM {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
   publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
@@ -603,14 +588,21 @@ workflow POST_SAREK {
     norm_fasta_ch = Channel.value(file(_normFasta))
     norm_fai_ch   = Channel.value(file("${_normFasta}.fai"))
 
-    // AddVAF runs BEFORE the split. bcftools +fill-tags computes VAF as
-    // alt/(sum of AD); on a still-multiallelic record that denominator is the
-    // full site depth, and `norm` then subsets the per-allele values correctly.
-    // Running it after the split instead gave alt/(ref+this_alt), dropping the
-    // other ALT's reads and inflating every allele of a 1/2 site — ACTC1
-    // chr15:34791307 reported VAF 1.000 on both alleles instead of 0.585/0.415.
-    AddVAF(BedFilterVCF.out)
-    NormalizeVCF(AddVAF.out, norm_fasta_ch, norm_fai_ch)
+    // No FORMAT/VAF tag is written. `bcftools +fill-tags` used to run here, but
+    // CONSENSUS_CALLING already splits multiallelics (NormalizeDV/NormalizeHC
+    // run `norm -m -any`), so fill-tags only ever saw biallelic records with
+    // AD=[site_ref, this_alt] and computed alt/(ref+alt). At a 1/2 site the
+    // sibling allele's reads are not in the record, so there is no denominator
+    // to compute against: ACTC1 chr15:34791307 came out 1.000 on BOTH alleles
+    // instead of 0.585/0.415, and MSH2 chr2:47414420 T>G read 0.79 instead of
+    // 0.34. Reordering cannot fix it -- the split happens upstream.
+    //
+    // Verified on IQMM: of 915 records the tag was right on the 907 biallelic
+    // rows and wrong on all 8 multiallelic ones, and nothing read it. The
+    // report recomputes VAF from AD against site-level depth
+    // (AD_ref + sum of every ALT's AD) and overwrites all 915 rows, so a wrong
+    // value in a published clinical VCF was the tag's only remaining effect.
+    NormalizeVCF(BedFilterVCF.out, norm_fasta_ch, norm_fai_ch)
     FilterVCF(NormalizeVCF.out)
     vep_ch = params.run_vep ? VEP_Annotate(
       FilterVCF.out, 
