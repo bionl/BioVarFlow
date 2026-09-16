@@ -82,20 +82,6 @@ process FilterVCF {
   """
 }
 
-process AddVAF {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
-  input:
-    tuple val(meta), path(vcf)
-  output:
-    tuple val(meta), path("${meta.sample}.vaf_added.vcf.gz")
-  script:
-    def sample = meta.sample
-  """
-  bcftools +fill-tags $vcf -Oz -o ${sample}.vaf_added.vcf.gz -- -t FORMAT/VAF
-  tabix -p vcf ${sample}.vaf_added.vcf.gz
-  """
-}
-
 process BedFilterBAM {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
   input:
@@ -353,6 +339,77 @@ process SexCheck {
   """
 }
 
+// ── Per-variant, per-allele strand bias from the RAW alignment ──────────────
+//
+// The existing strand QC (ForwardReverseRatio) is per-EXON and counts every
+// read regardless of allele, so it cannot see a skew confined to the alt reads.
+// GATK's INFO/FS can, but it is computed on post-reassembly allele depths: for
+// MSH2 chr2:47414420 T>G it reported FS=43.4 (under the standard >60 filter)
+// while the raw pileup showed 0 forward / 11 reverse alt reads against 49/8
+// reference -- Fisher p = 4.9e-08, i.e. FS ~73.
+//
+// bcftools mpileup recomputes allele depths from the alignment itself. ADF/ADR
+// are the per-allele forward/reverse counts, giving the 2x2 table directly, and
+// unlike a plain samtools pileup they cover indels as well as SNVs. --no-BAQ
+// keeps indel-adjacent bases from being down-weighted.
+process StrandBiasPileup {
+  tag { "${meta.sample} (${meta.assay})" }
+  input:
+    tuple val(meta), path(vcf), path(bam), path(bai)
+    path fasta
+    path fai
+  output:
+    tuple val(meta), path("${meta.sample}_mpileup_adf_adr.tsv")
+  script:
+    def sample = meta.sample
+  """
+  set -euo pipefail
+  # No index needed: VEP emits a plain uncompressed VCF, `query` streams it, and
+  # --targets-file (unlike --regions-file) reads sequentially rather than seeking.
+  #
+  # uniq is required, not tidiness: a --targets-file must hold each position
+  # once, and a normalized VCF repeats POS for every ALT of a multiallelic site.
+  bcftools query -f '%CHROM\\t%POS\\n' $vcf | uniq > sites.txt
+
+  # Deliberately NOT `bcftools call -C alleles`. Constraining the pileup to the
+  # caller's alleles looks like the right way to fix indel counting, and it does
+  # match more indels -- but `call` makes a GENOTYPE decision, and when alt
+  # support is weak and one-sided it calls the site hom-ref and drops the ALT
+  # entirely. That is exactly the artifact class this check exists to find: on
+  # IQMM it returned ALT='.' for MSH2, RUNX1 and DSG2 alike and flagged nothing.
+  # Plain mpileup reports what it sees and lets the Fisher test decide.
+  bcftools mpileup \\
+    --targets-file sites.txt \\
+    --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \\
+    --fasta-ref $fasta \\
+    --min-BQ 13 --min-MQ 0 --no-BAQ --max-depth 8000 \\
+    -Ou $bam \\
+  | bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%ADF\\t%ADR]\\n' \\
+  > ${sample}_mpileup_adf_adr.tsv
+  """
+}
+
+// Fisher test over the pileup counts. Split from StrandBiasPileup only because
+// of containers: the bcftools biocontainer has no python3, and this half runs in
+// the same python-bionl image as the other report scripts.
+process StrandBiasTest {
+  tag { "${meta.sample} (${meta.assay})" }
+  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
+  input:
+    tuple val(meta), path(pileup), path(vcf)
+    each path(script)
+  output:
+    tuple val(meta), path("${meta.sample}_strand_bias.tsv")
+  script:
+    def sample = meta.sample
+  """
+  python3 ${script} \\
+    --mpileup ${pileup} \\
+    --vcf $vcf \\
+    --out ${sample}_strand_bias.tsv
+  """
+}
+
 process BcftoolsStats {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
   publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
@@ -422,7 +479,8 @@ process LeanReport {
           path(mosdepth_summary),
           path(sex_check),
           path(gaps20), path(gaps30),
-          path(thresholds)
+          path(thresholds),
+          path(strand_bias)
     each path(script)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants.xlsx")
@@ -437,7 +495,8 @@ process LeanReport {
     --mosdepth-summary ${mosdepth_summary} \
     --acmg-thresholds ${thresholds} \
     --sexcheck ${sex_check} \
-    --gaps20 ${gaps20} --gaps30 ${gaps30}
+    --gaps20 ${gaps20} --gaps30 ${gaps30} \
+    --strand-bias ${strand_bias}
   """
 }
 
@@ -498,9 +557,19 @@ workflow POST_SAREK {
 
     NormalizeVCF(BedFilterVCF.out, norm_fasta_ch, norm_fai_ch)
     FilterVCF(NormalizeVCF.out)
-    AddVAF(FilterVCF.out)
+    // No FORMAT/VAF tag is written. `bcftools +fill-tags` used to run here, but
+    // CONSENSUS_CALLING already splits multiallelics (NormalizeDV/NormalizeHC
+    // run `norm -m -any`), so fill-tags only ever saw biallelic records with
+    // AD=[site_ref, this_alt] and computed alt/(ref+alt). At a 1/2 site the
+    // sibling allele's reads are not in the record, so there is no denominator
+    // to compute against -- ACTC1 chr15:34791307 came out 1.000 on BOTH alleles
+    // instead of 0.585/0.415. Reordering cannot fix it: the split is upstream.
+    //
+    // Nothing read the tag. The report recomputes VAF from AD against
+    // site-level depth (AD_ref + sum of every ALT's AD) and overwrites every
+    // row, so a wrong value in a published clinical VCF was its only effect.
     vep_ch = params.run_vep ? VEP_Annotate(
-      AddVAF.out, 
+      FilterVCF.out, 
       file(params.vep_cache), 
       file(params.vep_fasta), 
       file(params.vep_fasta + ".fai"), 
@@ -517,7 +586,7 @@ workflow POST_SAREK {
       file(params.bayesdel_vcf), 
       file(params.bayesdel_vcf + ".tbi"),
       file(params.vep_plugins)
-      ) : AddVAF.out  // (sample, vcf)
+      ) : FilterVCF.out  // (sample, vcf)
 
     // BAM path
     BedFilterBAM(sample_inputs.map { s, vcf, bam, bai -> tuple(s, vcf, bam) }, bed_ch)
@@ -532,6 +601,14 @@ workflow POST_SAREK {
     CoverageGapsAnnotation(MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, quantized, thresholds) }, bed_ch)
     SexCheck(bam_sample_ch.map { s, bam, bai -> tuple(s, bam) })
     BcftoolsStats(vep_ch.map { s, vcf -> tuple(s, vcf) })
+
+    // Per-variant strand bias, recomputed from the raw alignment (see the
+    // StrandBiasPileup header for why the caller's own FS is not enough).
+    strand_bias_script_ch = Channel.fromPath("${params.scriptdir}/strand_bias.py").first()
+    StrandBiasPileup(
+      vep_ch.join(bam_sample_ch).map { s, vcf, bam, bai -> tuple(s, vcf, bam, bai) },
+      norm_fasta_ch, norm_fai_ch)
+    StrandBiasTest(StrandBiasPileup.out.join(vep_ch), strand_bias_script_ch)
 
     // prepare joins keyed by sample
     exon_cov_ch         = CoverageSummary.out.map { s, summary, per_base -> tuple(s, summary) }
@@ -552,6 +629,7 @@ workflow POST_SAREK {
       .join(gaps20_ch)
       .join(gaps30_ch)
       .join(thresholds_ch)
+      .join(StrandBiasTest.out)
     LeanReport(lean_input_ch, script_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 }

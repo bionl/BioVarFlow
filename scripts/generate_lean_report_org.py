@@ -30,6 +30,8 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--strand-bias", default=None,
+               help="strand_bias.py TSV: per-variant ALT_FWD/ALT_REV and Fisher p from the raw alignment")
 
 
 
@@ -850,6 +852,48 @@ if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
     _ref_frac = (_ar / _site_ad).where(_site_ad > 0)
     _hom_with_ref = df["Zygosity"].astype(str).eq("hom") & (_ref_frac > 0.10)
 
+    # ---- Strand bias (raw alignment) -----------------------------------
+    # Joined on coordinates + alleles from strand_bias.py, which recomputes the
+    # per-allele forward/reverse counts with bcftools mpileup. The caller's own
+    # FS is computed after local reassembly and can badly understate the skew:
+    # MSH2 chr2:47414420 T>G had FS=43.4 (passing FS>60) but 0/14 forward alt
+    # reads in the raw pileup, p=4.9e-08. Advisory only -- flagged, not dropped.
+    #
+    # StrandBias carries the OUTCOME in words, because three very different
+    # situations otherwise render identically in Excel as an empty cell or a
+    # high p-value:
+    #   PASS                    tested with enough reads to have found skew
+    #   UNDERPOWERED            too few alt reads for any split to reach the
+    #                           threshold -- absence of evidence, not evidence
+    #                           of absence (SEC23B chr20:18524919, 9 alt reads,
+    #                           best achievable p = 0.01)
+    #   NOT_TESTED_*            indel, or no usable pileup record
+    # A reviewer reading a blank cell as "no problem" is exactly the failure
+    # this check exists to prevent, so the status is never left implicit.
+    df["ALT_FWD"] = pd.NA
+    df["ALT_REV"] = pd.NA
+    df["StrandBias_P"] = pd.NA
+    # NOT_RUN distinguishes "the check was never invoked" from "invoked and
+    # found nothing for this variant".
+    df["StrandBias"] = "NOT_RUN"
+    _sb_flag = pd.Series(False, index=df.index)
+    if args.strand_bias and os.path.exists(args.strand_bias):
+        df["StrandBias"] = "NOT_TESTED_NO_PILEUP"
+        _sb = pd.read_csv(args.strand_bias, sep="\t", dtype=str)
+        _sb = _sb.drop_duplicates(subset=["CHROM", "POS", "REF", "ALT"])
+        _sb_idx = _sb.set_index(["CHROM", "POS", "REF", "ALT"])
+        _keys = list(zip(df["Chrom"].astype(str), df["Pos"].astype(str),
+                         df["Ref"].astype(str), df["Alt"].astype(str)))
+        for _i, _k in zip(df.index, _keys):
+            if _k not in _sb_idx.index:
+                continue
+            _row = _sb_idx.loc[_k]
+            df.at[_i, "ALT_FWD"] = _row["ALT_FWD"]
+            df.at[_i, "ALT_REV"] = _row["ALT_REV"]
+            df.at[_i, "StrandBias_P"] = _row["StrandBias_P"]
+            df.at[_i, "StrandBias"] = _row["StrandBias_Flag"]
+            _sb_flag.at[_i] = (_row["StrandBias_Flag"] == "STRAND_BIAS")
+
     _flags = []
     for _i in df.index:
         _f = []
@@ -859,8 +903,15 @@ if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
             _f.append(f"AD_DP_DIFF={df.at[_i, 'AD_Sum_vs_DP']}")
         if df.at[_i, "Multiallelic"] == "Y":
             _f.append("MULTIALLELIC")
+        if _sb_flag.get(_i, False):
+            _f.append(f"STRAND_BIAS(alt {df.at[_i, 'ALT_FWD']}+/{df.at[_i, 'ALT_REV']}-, "
+                      f"p={df.at[_i, 'StrandBias_P']})")
         _flags.append(";".join(_f))
     df["QC_Flags"] = _flags
+
+for _c in ("QC_Flags", "ALT_FWD", "ALT_REV", "StrandBias_P", "StrandBias", "Multiallelic"):
+    if _c not in df.columns:
+        df[_c] = pd.NA
 
 # -------------------------
 # Build tabs
@@ -920,7 +971,9 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         acmg = acmg[acmg["Gene"].isin(sf_genes)]
     acmg_cols = [
         "Gene","Variant","HGVSc","HGVSp","MANE_ID","Zygosity","GT","AD_Ref","AD_Alt","DP","GQ","QUAL",
-        "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full"
+        "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
+        # Raw-alignment strand bias: advisory, never a filter. See strand_bias.py.
+        "ALT_FWD","ALT_REV","StrandBias_P","StrandBias","QC_Flags"
     ]
     acmg[acmg_cols].to_excel(xw, index=False, sheet_name="ACMG SF (P-LP)")
 
@@ -970,7 +1023,9 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     # 5) PASS variant table
     pass_cols = [
         "Variant","Gene","HGVSc","HGVSp","MANE_ID","Transcript","Consequence","GT","Zygosity","AD_Ref","AD_Alt","DP","GQ","QUAL",
-        "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full"
+        "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
+        # Raw-alignment strand bias: advisory, never a filter. See strand_bias.py.
+        "ALT_FWD","ALT_REV","StrandBias_P","StrandBias","QC_Flags"
     ]
     df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
 
