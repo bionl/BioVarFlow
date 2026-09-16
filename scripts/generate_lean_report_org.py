@@ -34,6 +34,19 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--exomiser", default=None,
+               help="Exomiser <sample>_exomiser.variants.tsv. Adds an 'Exomiser' tab and a "
+                    "'Prioritised' tab. A zero-byte NO_FILE placeholder means Exomiser did not "
+                    "run for this sample and both tabs are skipped.")
+p.add_argument("--exomiser-top", type=int, default=0,
+               help="Rows kept on the Exomiser tab, by rank. 0 (the default) keeps every variant "
+                    "Exomiser emitted -- 745 for IQMM. Set a positive number to cap the tab; the "
+                    "full TSV and HTML are published under <outdir>/exomiser either way.")
+p.add_argument("--prioritised-min-score", type=float, default=0.05,
+               help="Prioritised tab: minimum Exomiser combined score for an OFF-panel variant "
+                    "to be listed (default 0.05). Panel variants ranked by Exomiser are always "
+                    "listed regardless of score. Set very high to make the tab a pure "
+                    "panel/Exomiser intersection.")
 p.add_argument("--report-min-vaf", type=float, default=0.20,
                help="Reportable sheets: drop variants below this VAF. Removes low-level "
                     "artifacts, chiefly homopolymer-slippage indels, which the strand-bias "
@@ -1023,6 +1036,67 @@ for _c in ("QC_Flags", "ALT_FWD", "ALT_REV", "StrandBias_P", "StrandBias", "Mult
         df[_c] = pd.NA
 
 # -------------------------
+# Exomiser
+# -------------------------
+# Exomiser ranks the WHOLE callset against the patient's HPO terms, including
+# genes outside the panel -- that is the point of running it. The reporting
+# sheets are panel-restricted, so the two views are complementary rather than
+# redundant, and the Prioritised tab is where they are reconciled.
+#
+# Of Exomiser's 41 output columns most are provenance or duplicates of a MAX_*
+# column; these are the ones a reviewer acts on.
+EXOMISER_COLS = [
+    ("#RANK",                          "Rank"),
+    ("GENE_SYMBOL",                    "Gene"),
+    ("HGVS",                           "HGVS"),
+    ("GENOTYPE",                       "Genotype"),
+    ("FUNCTIONAL_CLASS",               "Consequence"),
+    ("MOI",                            "MOI"),
+    ("EXOMISER_GENE_COMBINED_SCORE",   "Combined_Score"),
+    ("EXOMISER_GENE_PHENO_SCORE",      "Pheno_Score"),
+    ("EXOMISER_VARIANT_SCORE",         "Variant_Score"),
+    ("CONTRIBUTING_VARIANT",           "Contributing"),
+    ("EXOMISER_ACMG_CLASSIFICATION",   "Exomiser_ACMG"),
+    ("EXOMISER_ACMG_DISEASE_NAME",     "Exomiser_Disease"),
+    ("CLINVAR_PRIMARY_INTERPRETATION", "ClinVar"),
+    ("CLINVAR_STAR_RATING",            "ClinVar_Stars"),
+    ("MAX_FREQ",                       "Max_Freq_pct"),
+    ("GENE_CONSTRAINT_LOEUF",          "LOEUF"),
+]
+
+
+def load_exomiser(path):
+    """Exomiser variants TSV -> DataFrame, or None when it did not run.
+
+    LeanReport is handed a zero-byte assets/NO_FILE placeholder for samples
+    Exomiser skipped, so that the workbook is still produced. Treat any empty
+    or header-less file the same way.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        df = pd.read_csv(path, sep="\t", dtype=str)
+    except Exception:
+        return None
+    if "#RANK" not in df.columns or df.empty:
+        return None
+    df["Variant"] = ("chr" + df["CONTIG"].astype(str).str.removeprefix("chr")
+                     + ":" + df["START"].astype(str)
+                     + ":" + df["REF"].astype(str) + ":" + df["ALT"].astype(str))
+    df["_rank"] = pd.to_numeric(df["#RANK"], errors="coerce")
+    return df.sort_values("_rank", kind="stable")
+
+
+def exomiser_view(df):
+    """Rename to the reviewer-facing columns, keeping only those present."""
+    cols = [(src, dst) for src, dst in EXOMISER_COLS if src in df.columns]
+    out = df[["Variant"] + [c for c, _ in cols]].copy()
+    out = out.rename(columns=dict(cols))
+    return out[["Rank", "Gene", "Variant"] +
+               [d for _, d in cols if d not in ("Rank", "Gene")]]
+
+
+# -------------------------
 # Build tabs
 # -------------------------
 with pd.ExcelWriter(args.xlsx_out) as xw:
@@ -1093,6 +1167,8 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "Gaps<30x_n","Gaps<30x_bp","Gaps<30x_intervals"
     ]
 
+    reportable_sheets = []   # filled by write_gene_set_sheets, read by Prioritised
+
     def write_gene_set_sheets(gene_set, variants_sheet, gaps_sheet, genes_cov_sheet,
                               report_min_vaf=args.report_min_vaf,
                               report_max_af=args.report_max_af):
@@ -1161,6 +1237,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         if gene_set:
             variants = variants[variants["Gene"].isin(gene_set)]
         variants[variant_cols].to_excel(xw, index=False, sheet_name=variants_sheet)
+        reportable_sheets.append(variants)
 
         # ---- coverage gaps sheet ----
         combined = pd.DataFrame(columns=empty_gaps_cols)
@@ -1238,5 +1315,35 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     ]
     df_pass = df[df["FILTER"]=="PASS"].copy()
     df_pass[pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
+
+    # ---- Exomiser + Prioritised -------------------------------------------
+    _exo = load_exomiser(args.exomiser)
+    if _exo is not None:
+        _view = exomiser_view(_exo)
+        if args.exomiser_top and args.exomiser_top > 0:
+            _view = _view.head(args.exomiser_top)
+        _view.to_excel(xw, index=False, sheet_name="Exomiser")
+
+        # Prioritised: the two views reconciled.
+        #   PANEL+EXOMISER  on a Reportable sheet AND ranked by Exomiser -- the
+        #                   strongest signal, agreed by both a curated panel and
+        #                   a phenotype model that never saw the panel.
+        #   EXOMISER_ONLY   off-panel but highly ranked. Kept because the panel
+        #                   is 285 genes and Exomiser searches the exome: on
+        #                   IQMM the top hits included NUP214 (pheno 0.952) and
+        #                   ANAPC1 (stop_gained), neither on the panel. Dropping
+        #                   them would discard the reason Exomiser is run.
+        _rep = set()
+        for _rs in reportable_sheets:
+            if "Variant" in _rs.columns:
+                _rep.update(_rs["Variant"].astype(str))
+
+        _p = exomiser_view(_exo).copy()
+        _p.insert(0, "Source",
+                  _p["Variant"].map(lambda v: "PANEL+EXOMISER" if v in _rep else "EXOMISER_ONLY"))
+        _comb = pd.to_numeric(_p["Combined_Score"], errors="coerce").fillna(0)
+        _keep = (_p["Source"] == "PANEL+EXOMISER") | (_comb >= args.prioritised_min_score)
+        _p = _p[_keep]
+        _p.to_excel(xw, index=False, sheet_name="Prioritised")
 
 print(f"Wrote Excel report → {args.xlsx_out}")

@@ -334,8 +334,9 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
                 log.info "✓ Found ${count} BAM file(s)"
             }
 
-        // Run post-processing
-        POST_SAREK(vcf_ch, bam_ch, bed_ch)
+        // Run post-processing. Exomiser needs the consensus callset, which this
+        // entry point does not build, so the workbook simply omits its two tabs.
+        POST_SAREK(Channel.empty(), vcf_ch, bam_ch, bed_ch)
 }
 
 workflow RUN_FROM_POST_SAMPLESHEET {
@@ -388,8 +389,8 @@ workflow RUN_FROM_POST_SAMPLESHEET {
         vcf_ch.view { s, v -> "📄 VCF -> ${s} :: ${v.name}" }
         bam_ch.view { s, a, i -> "🧬 BAM -> ${s} :: ${a.name}" }
 
-        // Run post-processing (no consensus for post-samplesheet)
-        POST_SAREK(vcf_ch, bam_ch, bed_ch)
+        // Run post-processing (no consensus for post-samplesheet, so no Exomiser)
+        POST_SAREK(Channel.empty(), vcf_ch, bam_ch, bed_ch)
 }
 
 workflow RUN_FULL_VARIANT_CALLING {
@@ -542,11 +543,12 @@ workflow RUN_FULL_VARIANT_CALLING {
             log.warn "params.run_db_qc=false → skipping run_output_manifest.tsv (QC Gate JSON is required to populate qc_status / qc_recommendation)."
         }
 
-        // POST_SAREK (VEP annotation) is germline-only — skip in somatic mode
-        if (!params.somatic_mode) {
-            POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
-        }
-
+        // Exomiser runs BEFORE POST_SAREK so its per-sample TSVs can become the
+        // 'Exomiser' and 'Prioritised' tabs of the workbook. EXOMISER_BATCH
+        // carries errorStrategy 'ignore', and POST_SAREK substitutes a NO_FILE
+        // placeholder for any sample it has no result for, so a failed or
+        // skipped Exomiser costs those two tabs and nothing else.
+        exomiser_tsv_ch = Channel.empty()
         if (params.run_exomiser) {
             if (raw_consensus_ch == null) {
                 error "❌ --run_exomiser needs the consensus callset; run with --create_consensus."
@@ -556,6 +558,17 @@ workflow RUN_FULL_VARIANT_CALLING {
                     tuple([ sample: sample, assay: assayMap.get(sample, 'NA') ], vcf, tbi)
                 }
             )
+            // One batch task emits every sample's files together; key the
+            // per-variant TSVs back to their sample by filename.
+            exomiser_tsv_ch = EXOMISER.out.reports
+                .flatten()
+                .filter { f -> f.name.endsWith('_exomiser.variants.tsv') }
+                .map    { f -> tuple(f.name.replaceFirst(/_exomiser\.variants\.tsv$/, ''), f) }
+        }
+
+        // POST_SAREK (VEP annotation) is germline-only — skip in somatic mode
+        if (!params.somatic_mode) {
+            POST_SAREK(exomiser_tsv_ch, vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
         }
 }
 

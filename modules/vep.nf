@@ -12,6 +12,9 @@ params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/templ
 params.run_vep     = params.run_vep     ?: true
 params.min_dp   = params.min_dp   ?: 10
 params.min_qual = params.min_qual ?: 10
+// Rows kept on the Exomiser tab, by rank. 0 = keep everything Exomiser emitted
+// (745 for IQMM); set a positive number to cap it.
+params.exomiser_top = params.exomiser_top ?: 0
 
 // Reference used by NormalizeVCF for left-alignment/trimming: see the lazy
 // fallback to params.fasta inside POST_SAREK. Deliberately NOT resolved here at
@@ -504,7 +507,8 @@ process LeanReport {
           path(sex_check),
           path(gaps20), path(gaps30),
           path(thresholds),
-          path(strand_bias)
+          path(strand_bias),
+          path(exomiser_tsv)
     each path(script)
     each path(sf_genes_file)
     each path(hemonc_genes_file)
@@ -524,7 +528,9 @@ process LeanReport {
     --sf-genes ${sf_genes_file} \
     --hemonc-genes ${hemonc_genes_file} \
     --gaps20 ${gaps20} --gaps30 ${gaps30} \
-    --strand-bias ${strand_bias}
+    --strand-bias ${strand_bias} \
+    --exomiser ${exomiser_tsv} \
+    --exomiser-top ${params.exomiser_top}
   """
 }
 
@@ -555,6 +561,7 @@ process GENERATE_ACMG_REPORT {
 
 workflow POST_SAREK {
   take:
+    exomiser_ch // (sample, <sample>_exomiser.variants.tsv) -- may be empty
     vcf_ch   // (sample, vcf)
     bam_ch//  // // (samp//le, bam, bai)
     bed_ch   // value channel with //BED
@@ -667,6 +674,18 @@ workflow POST_SAREK {
       .join(gaps30_ch)
       .join(thresholds_ch)
       .join(StrandBiasTest.out)
-    LeanReport(lean_input_ch, script_ch, sf_genes_ch, hemonc_genes_ch)
+
+    // Exomiser runs as ONE batch for the whole run, so its per-sample TSVs are
+    // joined back here by sample name. remainder:true plus the NO_FILE stand-in
+    // keeps LeanReport running for samples Exomiser skipped, and -- with
+    // errorStrategy 'ignore' on EXOMISER_BATCH -- keeps a failed Exomiser from
+    // costing the reports entirely. The workbook simply omits the two tabs.
+    no_exomiser = file("${workflow.projectDir}/assets/NO_FILE")
+    lean_with_exo_ch = lean_input_ch
+      .map { tup -> tuple(tup[0].sample, tup) }
+      .join(exomiser_ch, remainder: true)
+      .filter { s, tup, exo -> tup != null }
+      .map    { s, tup, exo -> tup + [ exo ?: no_exomiser ] }
+    LeanReport(lean_with_exo_ch, script_ch, sf_genes_ch, hemonc_genes_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 }

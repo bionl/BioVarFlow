@@ -24,6 +24,11 @@ if (!params.containsKey("run_exomiser")) params.run_exomiser = true
 process EXOMISER_BATCH {
   tag { "${samples.size()} sample(s)" }
   publishDir "${params.outdir}/exomiser", mode: 'copy'
+  // Exomiser is supplementary: it adds two tabs to the workbook and its own
+  // HTML/TSV reports. A failure here must not sink a run whose panel reports
+  // are otherwise complete, so the batch is allowed to fail and POST_SAREK
+  // falls back to a NO_FILE placeholder for the affected samples.
+  errorStrategy 'ignore'
 
   input:
     val  samples        // [[sample:, pheno_sex:, hpo:], ...] -- order matches vcfs
