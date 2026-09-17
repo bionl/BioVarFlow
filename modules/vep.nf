@@ -15,6 +15,9 @@ params.min_qual = params.min_qual ?: 10
 // Rows kept on the Exomiser tab, by rank. 0 = keep everything Exomiser emitted
 // (745 for IQMM); set a positive number to cap it.
 params.exomiser_top = params.exomiser_top ?: 0
+// Cross-case table: 'all' keeps every row of the source sheet, 'coding'
+// restricts to protein-altering and splice-affecting consequences.
+params.merge_filter = params.merge_filter ?: 'all'
 
 // Reference used by NormalizeVCF for left-alignment/trimming: see the lazy
 // fallback to params.fasta inside POST_SAREK. Deliberately NOT resolved here at
@@ -481,6 +484,31 @@ process VEP_Annotate {
   """
 }
 
+// ── Cross-case table ────────────────────────────────────────────────────────
+//
+// One row per (case, variant) across every sample in the run, in the agreed
+// deliverable format. Runs once, after every per-sample workbook exists --
+// hence the .collect() on LeanReport.out at the call site.
+//
+// Sourcing is per case: the Prioritised sheet where Exomiser ran, the panel
+// Reportable sheet where it could not (no HPO terms), recorded in a Ranked_By
+// column. See the script's module docstring for why there is no middle option.
+process MergeVariantsTable {
+  tag { "${xlsx instanceof List ? xlsx.size() : 1} case(s)" }
+  publishDir "${params.outdir}/merged", mode: 'copy'
+  input:
+    path xlsx
+    each path(script)
+  output:
+    path "genetic_variants_all_samples.xlsx", emit: table
+  script:
+  """
+  python ${script} ${xlsx} \\
+    --out genetic_variants_all_samples.xlsx \\
+    --filter ${params.merge_filter}
+  """
+}
+
 process LeanReport {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay   
   publishDir "${params.outdir}/${meta.sample}/reports", mode: 'copy'
@@ -680,4 +708,8 @@ workflow POST_SAREK {
       .map    { s, tup, exo -> tup + [ exo ?: no_exomiser ] }
     LeanReport(lean_with_exo_ch, script_ch, sf_genes_ch, hemonc_genes_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
+
+    // collect() so this fires once, with every sample's workbook staged.
+    merge_script_ch = Channel.fromPath("${params.scriptdir}/merge_reportable_variants.py").first()
+    MergeVariantsTable(LeanReport.out.map { meta, xlsx -> xlsx }.collect(), merge_script_ch)
 }
