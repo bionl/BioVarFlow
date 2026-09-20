@@ -336,7 +336,7 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
 
         // Run post-processing. Exomiser needs the consensus callset, which this
         // entry point does not build, so the workbook simply omits its two tabs.
-        POST_SAREK(Channel.empty(), vcf_ch, bam_ch, bed_ch)
+        POST_SAREK(Channel.empty(), Channel.empty(), vcf_ch, bam_ch, bed_ch)
 }
 
 workflow RUN_FROM_POST_SAMPLESHEET {
@@ -390,7 +390,7 @@ workflow RUN_FROM_POST_SAMPLESHEET {
         bam_ch.view { s, a, i -> "🧬 BAM -> ${s} :: ${a.name}" }
 
         // Run post-processing (no consensus for post-samplesheet, so no Exomiser)
-        POST_SAREK(Channel.empty(), vcf_ch, bam_ch, bed_ch)
+        POST_SAREK(Channel.empty(), Channel.empty(), vcf_ch, bam_ch, bed_ch)
 }
 
 workflow RUN_FULL_VARIANT_CALLING {
@@ -566,9 +566,15 @@ workflow RUN_FULL_VARIANT_CALLING {
                 .map    { f -> tuple(f.name.replaceFirst(/_exomiser\.variants\.tsv$/, ''), f) }
         }
 
+        // Strand bias tests off-panel variants too, and needs the unfiltered
+        // consensus for their REF/ALT and AD. Keyed by meta to match vcf_ch.
+        raw_cons_keyed_ch = raw_consensus_ch == null ? Channel.empty()
+            : raw_consensus_ch.map { sample, vcf, tbi ->
+                  tuple([ sample: sample, assay: assayMap.get(sample, 'NA') ], vcf, tbi) }
+
         // POST_SAREK (VEP annotation) is germline-only — skip in somatic mode
         if (!params.somatic_mode) {
-            POST_SAREK(exomiser_tsv_ch, vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
+            POST_SAREK(exomiser_tsv_ch, raw_cons_keyed_ch, vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
         }
 }
 

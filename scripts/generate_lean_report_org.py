@@ -1065,6 +1065,47 @@ EXOMISER_COLS = [
 ]
 
 
+def load_strand_bias(path):
+    """{(chrom, pos, ref, alt): row} from strand_bias.py's TSV."""
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    try:
+        sb = pd.read_csv(path, sep="\t", dtype=str)
+    except Exception:
+        return {}
+    if "StrandBias_Flag" not in sb.columns:
+        return {}
+    sb = sb.drop_duplicates(subset=["CHROM", "POS", "REF", "ALT"])
+    return {(r["CHROM"], r["POS"], r["REF"], r["ALT"]): r for _, r in sb.iterrows()}
+
+
+def attach_strand_bias(view, sb):
+    """Add the strand-bias columns to an Exomiser view, keyed on Variant.
+
+    The check now runs on the RAW BAM over the union of panel and
+    Exomiser-ranked sites, so off-panel rows get a real result instead of a
+    blank. Before that they were untestable: the panel-filtered BAM does not
+    contain their reads, and an empty cell reads as "clean" to a reviewer --
+    which is exactly the failure the status labels exist to prevent.
+    """
+    cols = {"ALT_FWD": [], "ALT_REV": [], "StrandBias_P": [], "StrandBias": []}
+    for v in view["Variant"].astype(str):
+        parts = v.split(":")
+        row = sb.get(tuple(parts)) if len(parts) == 4 else None
+        if row is None:
+            cols["ALT_FWD"].append(pd.NA); cols["ALT_REV"].append(pd.NA)
+            cols["StrandBias_P"].append(pd.NA)
+            cols["StrandBias"].append("NOT_TESTED_NO_PILEUP" if sb else "NOT_RUN")
+        else:
+            cols["ALT_FWD"].append(row["ALT_FWD"]); cols["ALT_REV"].append(row["ALT_REV"])
+            cols["StrandBias_P"].append(row["StrandBias_P"])
+            cols["StrandBias"].append(row["StrandBias_Flag"])
+    out = view.copy()
+    for k, v in cols.items():
+        out[k] = v
+    return out
+
+
 def load_exomiser(path):
     """Exomiser variants TSV -> DataFrame, or None when it did not run.
 
@@ -1319,7 +1360,8 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     # ---- Exomiser + Prioritised -------------------------------------------
     _exo = load_exomiser(args.exomiser)
     if _exo is not None:
-        _view = exomiser_view(_exo)
+        _sb_map = load_strand_bias(args.strand_bias)
+        _view = attach_strand_bias(exomiser_view(_exo), _sb_map)
         if args.exomiser_top and args.exomiser_top > 0:
             _view = _view.head(args.exomiser_top)
         _view.to_excel(xw, index=False, sheet_name="Exomiser")
@@ -1338,7 +1380,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
             if "Variant" in _rs.columns:
                 _rep.update(_rs["Variant"].astype(str))
 
-        _p = exomiser_view(_exo).copy()
+        _p = attach_strand_bias(exomiser_view(_exo), _sb_map).copy()
         _p.insert(0, "Source",
                   _p["Variant"].map(lambda v: "PANEL+EXOMISER" if v in _rep else "EXOMISER_ONLY"))
         _comb = pd.to_numeric(_p["Combined_Score"], errors="coerce").fillna(0)

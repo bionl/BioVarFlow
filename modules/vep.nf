@@ -370,21 +370,55 @@ process SexCheck {
 process StrandBiasPileup {
   tag { "${meta.sample} (${meta.assay})" }
   input:
-    tuple val(meta), path(vcf), path(bam), path(bai)
+    // raw_bam is the full markduplicates BAM, NOT the BED-filtered one. The
+    // panel BAM cannot answer anything about off-panel variants -- those reads
+    // were removed by `samtools view -L` -- and that left every EXOMISER_ONLY
+    // row with a blank StrandBias, which reads as "clean" to a reviewer.
+    // At a panel position the two BAMs give identical counts anyway: a read
+    // overlapping a panel base overlaps the BED by definition, so it survives
+    // the filter. Using the raw BAM for both therefore costs nothing in
+    // accuracy and removes the blind spot.
+    tuple val(meta), path(vep_vcf), path(cons_vcf), path(cons_tbi),
+          path(exomiser_tsv), path(raw_bam), path(raw_bai)
     path fasta
     path fai
   output:
-    tuple val(meta), path("${meta.sample}_mpileup_adf_adr.tsv")
+    tuple val(meta), path("${meta.sample}_mpileup_adf_adr.tsv"),
+                     path("${meta.sample}_sb_sites.vcf.gz")
   script:
     def sample = meta.sample
   """
   set -euo pipefail
-  # No index needed: VEP emits a plain uncompressed VCF, `query` streams it, and
-  # --targets-file (unlike --regions-file) reads sequentially rather than seeking.
+
+  # Sites to test = panel variants (the VEP VCF) + everything Exomiser ranked.
+  # Exomiser writes CONTIG without the 'chr' prefix, so add it back.
+  bcftools query -f '%CHROM\\t%POS\\n' $vep_vcf > sites_raw.txt
+  if [ -s "$exomiser_tsv" ]; then
+    awk -F'\\t' 'NR>1 && \$15 != "" {
+        c = \$15; if (c !~ /^chr/) c = "chr" c; print c "\\t" \$16
+      }' $exomiser_tsv >> sites_raw.txt
+  fi
+  sort -u sites_raw.txt > sites.txt
+
+  # Subset the consensus VCF to those positions with awk rather than
+  # `bcftools view -R/-T`: both expect the positions file in the VCF's own
+  # contig order, and ours is a lexicographic sort -u (chr10 before chr2). A
+  # hash join sidesteps the ordering question entirely, and the output keeps
+  # the consensus VCF's order -- which is what the regions file below needs.
   #
-  # uniq is required, not tidiness: a --targets-file must hold each position
-  # once, and a normalized VCF repeats POS for every ALT of a multiallelic site.
-  bcftools query -f '%CHROM\\t%POS\\n' $vcf | uniq > sites.txt
+  # The consensus VCF is used, not the VEP VCF, because only it contains the
+  # off-panel records, with the REF/ALT and FORMAT/AD that strand_bias.py needs
+  # for allele matching and the indel VAF-reconciliation gate.
+  bcftools view $cons_vcf \\
+  | awk -F'\\t' 'NR==FNR { keep[\$1"\\t"\$2]; next }
+                 /^#/ { print; next }
+                 (\$1"\\t"\$2) in keep' sites.txt - \\
+  | bgzip -c > ${sample}_sb_sites.vcf.gz
+
+  # Regions for mpileup, derived from the subset VCF so they are already in
+  # reference order. -R seeks via the BAM index instead of streaming the whole
+  # file, which matters now that this runs on the full exome BAM.
+  bcftools query -f '%CHROM\\t%POS\\n' ${sample}_sb_sites.vcf.gz | uniq > regions.txt
 
   # Deliberately NOT `bcftools call -C alleles`. Constraining the pileup to the
   # caller's alleles looks like the right way to fix indel counting, and it does
@@ -394,11 +428,11 @@ process StrandBiasPileup {
   # IQMM it returned ALT='.' for MSH2, RUNX1 and DSG2 alike and flagged nothing.
   # Plain mpileup reports what it sees and lets the Fisher test decide.
   bcftools mpileup \\
-    --targets-file sites.txt \\
+    --regions-file regions.txt \\
     --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \\
     --fasta-ref $fasta \\
     --min-BQ 13 --min-MQ 0 --no-BAQ --max-depth 8000 \\
-    -Ou $bam \\
+    -Ou $raw_bam \\
   | bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%ADF\\t%ADR]\\n' \\
   > ${sample}_mpileup_adf_adr.tsv
   """
@@ -575,6 +609,7 @@ process GENERATE_ACMG_REPORT {
 workflow POST_SAREK {
   take:
     exomiser_ch // (sample, <sample>_exomiser.variants.tsv) -- may be empty
+    raw_cons_ch // (sample, consensus vcf, tbi) -- unfiltered; may be empty
     vcf_ch   // (sample, vcf)
     bam_ch//  // // (samp//le, bam, bai)
     bed_ch   // value channel with //BED
@@ -669,10 +704,25 @@ workflow POST_SAREK {
     // Per-variant strand bias, recomputed from the raw alignment (see the
     // StrandBiasPileup header for why the caller's own FS is not enough).
     strand_bias_script_ch = Channel.fromPath("${params.scriptdir}/strand_bias.py").first()
-    StrandBiasPileup(
-      vep_ch.join(bam_sample_ch).map { s, vcf, bam, bai -> tuple(s, vcf, bam, bai) },
-      norm_fasta_ch, norm_fai_ch)
-    StrandBiasTest(StrandBiasPileup.out.join(vep_ch), strand_bias_script_ch)
+
+    // Sites come from the panel VCF AND from Exomiser; alleles and AD come from
+    // the unfiltered consensus, which is the only VCF holding the off-panel
+    // records. Reads come from the RAW BAM (bam_ch), not BedFilterBAM.out --
+    // see the StrandBiasPileup header.
+    //
+    // remainder:true on both joins so a sample with no Exomiser result, or a
+    // run with no consensus at all, still gets its panel variants tested.
+    no_file_sb = file("${workflow.projectDir}/assets/NO_FILE")
+    sb_input_ch = vep_ch
+      .join(raw_cons_ch,  remainder: true)
+      .join(exomiser_ch,  remainder: true)
+      .join(bam_ch,       remainder: true)
+      .filter { it[1] != null && it[2] != null && it[5] != null }
+      .map { s, vep, cons, tbi, exo, bam, bai ->
+             tuple(s, vep, cons, tbi, exo ?: no_file_sb, bam, bai) }
+
+    StrandBiasPileup(sb_input_ch, norm_fasta_ch, norm_fai_ch)
+    StrandBiasTest(StrandBiasPileup.out, strand_bias_script_ch)
 
     // prepare joins keyed by sample
     exon_cov_ch         = CoverageSummary.out.map { s, summary, per_base -> tuple(s, summary) }

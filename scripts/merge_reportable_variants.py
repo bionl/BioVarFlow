@@ -40,6 +40,9 @@ import pandas as pd
 
 PRIORITISED = "Prioritised"
 REPORTABLE = "HemOnc (Reportable)"
+# ENST -> RefSeq, derived from the NCBI MANE summary (see --mane).
+DEFAULT_MANE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "data", "mane_enst_to_refseq.tsv")
 
 # Emitted for every row regardless of which sheet it came from.
 # The first six reproduce the agreed deliverable format exactly; the rest are
@@ -111,7 +114,43 @@ def panel_lookup(xl):
     return {str(r["Variant"]): r for _, r in pv.iterrows()}
 
 
-def rows_from_prioritised(df, panel):
+def load_mane(path):
+    """{ENST without version: (RefSeq_nuc, symbol)} from the MANE summary.
+
+    Off-panel Exomiser hits never reach VEP -- BedFilterVCF removes them before
+    annotation -- so the only transcript available for them is Exomiser's own
+    Ensembl accession. Clinical interpretation is done against RefSeq, so map
+    them here. Keyed without the version suffix because Exomiser's ENST version
+    and MANE's need not agree; the accession itself is stable.
+    """
+    out = {}
+    if not path or not os.path.exists(path):
+        return out
+    with open(path) as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 3 and f[0].startswith("ENST"):
+                out[f[0].split(".")[0]] = (f[1], f[2])
+    return out
+
+
+def to_refseq(tx, gene, mane):
+    """ENST -> MANE Select RefSeq, when we can do it safely.
+
+    The gene symbol must agree, otherwise the mapping is left alone: a silent
+    swap to the wrong transcript is far worse than an ENST a reviewer can look
+    up. On the current data all 124 off-panel rows mapped with zero symbol
+    mismatches.
+    """
+    if not tx or not str(tx).startswith("ENST"):
+        return tx
+    hit = mane.get(str(tx).split(".")[0])
+    if hit and (not gene or str(gene) == hit[1]):
+        return hit[0]
+    return tx
+
+
+def rows_from_prioritised(df, panel, mane):
     out = []
     for _, r in df.iterrows():
         tx, c, p = split_hgvs(r.get("HGVS"))
@@ -124,7 +163,8 @@ def rows_from_prioritised(df, panel):
             # Prefer the workbook's RefSeq annotation; fall back to Exomiser's.
             "HGVSc": (ann.get("HGVSc") if ann is not None else None) or c,
             "HGVSp": (ann.get("HGVSp") if ann is not None else None) or p,
-            "MANE_Select": (ann.get("MANE_ID") if ann is not None else None) or tx,
+            "MANE_Select": ((ann.get("MANE_ID") if ann is not None else None)
+                            or to_refseq(tx, r.get("Gene"), mane)),
             "Consequence": (ann.get("Consequence") if ann is not None else None)
                            or r.get("Consequence"),
             "Zygosity": (ann.get("Zygosity") if ann is not None else None)
@@ -196,6 +236,11 @@ def main():
                     help="auto (default) uses Prioritised where Exomiser ran and falls back to "
                          "the Reportable sheet otherwise; the other values force one sheet for "
                          "every case.")
+    ap.add_argument("--mane", default=DEFAULT_MANE,
+                    help="TSV mapping Ensembl transcripts to RefSeq: "
+                         "ENST<tab>NM_<tab>symbol, from the NCBI MANE summary. Used to convert "
+                         "off-panel Exomiser transcripts, which are Ensembl, to the RefSeq "
+                         "accessions used for interpretation. Pass '' to disable.")
     ap.add_argument("--reportable-sheet", default=REPORTABLE,
                     help=f"Fallback sheet name (default: '{REPORTABLE}')")
     args = ap.parse_args()
@@ -209,6 +254,10 @@ def main():
     paths = sorted(set(paths))
     if not paths:
         sys.exit("❌ No *_variants.xlsx found in the given inputs.")
+
+    mane = load_mane(args.mane)
+    if args.mane and not mane:
+        print(f"⚠️  no MANE mapping loaded from {args.mane} — off-panel rows keep Ensembl IDs")
 
     variant_rows, case_rows, skipped = [], [], []
 
@@ -225,7 +274,7 @@ def main():
 
         want_pri = args.source in ("auto", "prioritised")
         if want_pri and pri is not None and len(pri):
-            ranked_by, src_df, rows = "exomiser", pri, rows_from_prioritised(pri, panel_lookup(xl))
+            ranked_by, src_df, rows = "exomiser", pri, rows_from_prioritised(pri, panel_lookup(xl), mane)
         elif want_pri and pri is not None:
             # Exomiser ran and produced nothing -- a real result, distinct from
             # having no phenotype data at all.
