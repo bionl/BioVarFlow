@@ -40,6 +40,7 @@ import pandas as pd
 
 PRIORITISED = "Prioritised"
 REPORTABLE = "HemOnc (Reportable)"
+ACMG = "ACMG SF (Reportable)"
 # ENST -> RefSeq, derived from the NCBI MANE summary (see --mane).
 DEFAULT_MANE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "..", "data", "mane_enst_to_refseq.tsv")
@@ -51,6 +52,7 @@ DEFAULT_MANE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Exomiser ranked it.
 OUT_COLS = [
     "Case #", "Case ID", "Gene", "Variant", "HGVSc", "MANE_Select",
+    "Panel",
     "HGVSp", "Consequence", "Zygosity", "ClinVar", "ClinVar_Stars", "gnomAD_AF",
     "StrandBias", "Exo_Rank", "Exo_Score", "Exo_Disease",
     "Ranked_By", "Scope",
@@ -150,6 +152,95 @@ def to_refseq(tx, gene, mane):
     return tx
 
 
+def exomiser_lookup(xl):
+    """{Variant: row} from the Exomiser tab, for attaching rank/score."""
+    ex = xl.get("Exomiser")
+    if ex is None or not len(ex) or "Variant" not in ex.columns:
+        return {}
+    return {str(r["Variant"]): r for _, r in ex.iterrows()}
+
+
+def rows_superset(xl, mane, reportable_sheet):
+    """Every Reportable variant, plus Exomiser's off-panel hits.
+
+    Prioritised alone is NOT safe as the spine. It is built from Exomiser's
+    output, and Exomiser filters before it ranks -- ~570 of ~240,000 variants
+    survive for a typical case, with intronic, synonymous and common ones
+    discarded. On IQMM that left 27 of 29 HemOnc and 17 of 22 ACMG SF
+    Reportable variants absent from Prioritised, including a Pathogenic GATA2
+    in another case. Panel membership already justifies a row; Exomiser is
+    supporting evidence, not a gate.
+
+    So: take the Reportable sheets whole, attach Exomiser rank/score where it
+    happened to rank them, and add the off-panel hits Exomiser found on top.
+    """
+    exo = exomiser_lookup(xl)
+    out, seen = [], {}
+
+    for sheet, tag in ((ACMG, "ACMG SF"), (reportable_sheet, "HemOnc")):
+        df = xl.get(sheet)
+        if df is None or not len(df):
+            continue
+        for _, r in df.iterrows():
+            key = str(r.get("Variant"))
+            if key in seen:            # the 8 genes listed on both panels
+                if tag not in seen[key]["Panel"]:
+                    seen[key]["Panel"] += "+" + tag
+                continue
+            e = exo.get(key)
+            row = {
+                "Scope": "PANEL_REPORTABLE",
+                "Panel": tag,
+                "Gene": r.get("Gene"),
+                "Variant": r.get("Variant"),
+                "HGVSc": r.get("HGVSc"),
+                "HGVSp": r.get("HGVSp"),
+                "MANE_Select": r.get("MANE_ID"),
+                "Consequence": r.get("Consequence"),
+                "Zygosity": r.get("Zygosity"),
+                "ClinVar": r.get("ClinVar"),
+                "ClinVar_Stars": r.get("ClinVar_Stars"),
+                "gnomAD_AF": r.get("gnomAD_AF"),
+                "StrandBias": r.get("StrandBias"),
+                # Blank where Exomiser never ranked it -- a fact about
+                # Exomiser's filters, not a reason to drop a panel finding.
+                "Exo_Rank": e.get("Rank") if e is not None else None,
+                "Exo_Score": e.get("Combined_Score") if e is not None else None,
+                "Exo_Disease": e.get("Exomiser_Disease") if e is not None else None,
+            }
+            seen[key] = row
+            out.append(row)
+
+    pri = xl.get(PRIORITISED)
+    if pri is not None and len(pri) and "Source" in pri.columns:
+        for _, r in pri[pri["Source"] == "EXOMISER_ONLY"].iterrows():
+            key = str(r.get("Variant"))
+            if key in seen:
+                continue
+            tx, c, pp = split_hgvs(r.get("HGVS"))
+            row = {
+                "Scope": "OFF_PANEL",
+                "Panel": "",
+                "Gene": r.get("Gene"),
+                "Variant": r.get("Variant"),
+                "HGVSc": c,
+                "HGVSp": pp,
+                "MANE_Select": to_refseq(tx, r.get("Gene"), mane),
+                "Consequence": r.get("Consequence"),
+                "Zygosity": r.get("Genotype"),
+                "ClinVar": r.get("ClinVar"),
+                "ClinVar_Stars": r.get("ClinVar_Stars"),
+                "gnomAD_AF": None,
+                "StrandBias": r.get("StrandBias"),
+                "Exo_Rank": r.get("Rank"),
+                "Exo_Score": r.get("Combined_Score"),
+                "Exo_Disease": r.get("Exomiser_Disease"),
+            }
+            seen[key] = row
+            out.append(row)
+    return out
+
+
 def rows_from_prioritised(df, panel, mane):
     out = []
     for _, r in df.iterrows():
@@ -233,9 +324,10 @@ def main():
                     help="With --filter coding, keep anything scoring at least this on "
                          "SpliceAI_DS_max regardless of consequence (default: 0.2)")
     ap.add_argument("--source", choices=["auto", "prioritised", "reportable"], default="auto",
-                    help="auto (default) uses Prioritised where Exomiser ran and falls back to "
-                         "the Reportable sheet otherwise; the other values force one sheet for "
-                         "every case.")
+                    help="auto (default) emits every Reportable variant plus Exomiser's "
+                         "off-panel hits -- a superset, so no panel finding can be lost. "
+                         "'prioritised' uses only the Prioritised sheet (Exomiser-filtered, "
+                         "drops most panel variants); 'reportable' uses only the panel sheet.")
     ap.add_argument("--mane", default=DEFAULT_MANE,
                     help="TSV mapping Ensembl transcripts to RefSeq: "
                          "ENST<tab>NM_<tab>symbol, from the NCBI MANE summary. Used to convert "
@@ -248,7 +340,11 @@ def main():
     paths = []
     for item in args.inputs:
         if os.path.isdir(item):
-            paths.extend(glob.glob(os.path.join(item, "*_variants.xlsx")))
+            # *variants*.xlsx, not *_variants.xlsx: files that have been through
+            # a browser download arrive as "AHQX_variants (1).xlsx", and silently
+            # skipping those loses whole cases from the deliverable.
+            paths.extend(p for p in glob.glob(os.path.join(item, "*variants*.xlsx"))
+                         if not os.path.basename(p).startswith("~$"))
         else:
             paths.append(item)
     paths = sorted(set(paths))
@@ -272,10 +368,17 @@ def main():
         pri = xl.get(PRIORITISED)
         rep = xl.get(args.reportable_sheet)
 
-        want_pri = args.source in ("auto", "prioritised")
-        if want_pri and pri is not None and len(pri):
+        if args.source == "auto":
+            # Superset: every Reportable variant plus Exomiser's off-panel hits.
+            rows = rows_superset(xl, mane, args.reportable_sheet)
+            ranked_by = ("exomiser" if (pri is not None and len(pri)) else "panel_only")
+            src_df = rep
+            if not rows and rep is None:
+                skipped.append((path, f"no '{args.reportable_sheet}' or '{ACMG}' sheet"))
+                continue
+        elif args.source == "prioritised" and pri is not None and len(pri):
             ranked_by, src_df, rows = "exomiser", pri, rows_from_prioritised(pri, panel_lookup(xl), mane)
-        elif want_pri and pri is not None:
+        elif args.source == "prioritised" and pri is not None:
             # Exomiser ran and produced nothing -- a real result, distinct from
             # having no phenotype data at all.
             ranked_by, src_df, rows = "exomiser_none", pri, []

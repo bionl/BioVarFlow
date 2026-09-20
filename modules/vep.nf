@@ -712,14 +712,23 @@ workflow POST_SAREK {
     //
     // remainder:true on both joins so a sample with no Exomiser result, or a
     // run with no consensus at all, still gets its panel variants tested.
-    no_file_sb = file("${workflow.projectDir}/assets/NO_FILE")
+    // Key every channel on the SAMPLE NAME before joining. vep_ch, raw_cons_ch
+    // and bam_ch are keyed by the meta map, but exomiser_ch is keyed by a plain
+    // sample string (main.nf derives it from the TSV filename). Joining those
+    // directly matches nothing, silently sending every sample down the NO_FILE
+    // branch.
+    no_file_sb = file("${workflow.projectDir}/assets/NO_FILE", checkIfExists: true)
     sb_input_ch = vep_ch
-      .join(raw_cons_ch,  remainder: true)
-      .join(exomiser_ch,  remainder: true)
-      .join(bam_ch,       remainder: true)
-      .filter { it[1] != null && it[2] != null && it[5] != null }
-      .map { s, vep, cons, tbi, exo, bam, bai ->
-             tuple(s, vep, cons, tbi, exo ?: no_file_sb, bam, bai) }
+      .map { meta, vcf -> tuple(meta.sample, meta, vcf) }
+      .join(raw_cons_ch.map { meta, v, t -> tuple(meta.sample, v, t) }, remainder: true)
+      .join(exomiser_ch,                                                remainder: true)
+      .join(bam_ch.map { meta, b, i -> tuple(meta.sample, b, i) },      remainder: true)
+      // remainder:true also emits right-only rows (a sample present in one
+      // channel but not vep_ch); drop those, and any sample missing the VCF,
+      // consensus or BAM the pileup actually needs.
+      .filter { it[1] != null && it[2] != null && it[3] != null && it[6] != null }
+      .map { sample, meta, vep, cons, tbi, exo, bam, bai ->
+             tuple(meta, vep, cons, tbi, exo ?: no_file_sb, bam, bai) }
 
     StrandBiasPileup(sb_input_ch, norm_fasta_ch, norm_fai_ch)
     StrandBiasTest(StrandBiasPileup.out, strand_bias_script_ch)
