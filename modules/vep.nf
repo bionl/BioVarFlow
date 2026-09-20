@@ -378,8 +378,14 @@ process StrandBiasPileup {
     // overlapping a panel base overlaps the BED by definition, so it survives
     // the filter. Using the raw BAM for both therefore costs nothing in
     // accuracy and removes the blind spot.
+    // No BAM index. main.nf builds the .bai path by string concatenation and
+    // never verifies it on GCS (checkIfExists: false), so it can point at a
+    // file that does not exist -- which is what it did. Nothing consumed it
+    // before: BedFilterBAM takes only the BAM and runs its own samtools index.
+    // Streaming with --targets-file sidesteps the question; the bcftools
+    // container has no samtools, so this process cannot build one either.
     tuple val(meta), path(vep_vcf), path(cons_vcf), path(cons_tbi),
-          path(exomiser_tsv), path(raw_bam), path(raw_bai)
+          path(exomiser_tsv), path(raw_bam)
     path fasta
     path fai
   output:
@@ -415,9 +421,9 @@ process StrandBiasPileup {
                  (\$1"\\t"\$2) in keep' sites.txt - \\
   | bgzip -c > ${sample}_sb_sites.vcf.gz
 
-  # Regions for mpileup, derived from the subset VCF so they are already in
-  # reference order. -R seeks via the BAM index instead of streaming the whole
-  # file, which matters now that this runs on the full exome BAM.
+  # Targets for mpileup, derived from the subset VCF so they are already in
+  # reference order. --targets-file streams the BAM rather than seeking, which
+  # is slower on a whole-exome BAM than -R would be but needs no index.
   bcftools query -f '%CHROM\\t%POS\\n' ${sample}_sb_sites.vcf.gz | uniq > regions.txt
 
   # Deliberately NOT `bcftools call -C alleles`. Constraining the pileup to the
@@ -428,7 +434,7 @@ process StrandBiasPileup {
   # IQMM it returned ALT='.' for MSH2, RUNX1 and DSG2 alike and flagged nothing.
   # Plain mpileup reports what it sees and lets the Fisher test decide.
   bcftools mpileup \\
-    --regions-file regions.txt \\
+    --targets-file regions.txt \\
     --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \\
     --fasta-ref $fasta \\
     --min-BQ 13 --min-MQ 0 --no-BAQ --max-depth 8000 \\
@@ -722,13 +728,13 @@ workflow POST_SAREK {
       .map { meta, vcf -> tuple(meta.sample, meta, vcf) }
       .join(raw_cons_ch.map { meta, v, t -> tuple(meta.sample, v, t) }, remainder: true)
       .join(exomiser_ch,                                                remainder: true)
-      .join(bam_ch.map { meta, b, i -> tuple(meta.sample, b, i) },      remainder: true)
+      .join(bam_ch.map { meta, b, i -> tuple(meta.sample, b) },         remainder: true)
       // remainder:true also emits right-only rows (a sample present in one
       // channel but not vep_ch); drop those, and any sample missing the VCF,
       // consensus or BAM the pileup actually needs.
       .filter { it[1] != null && it[2] != null && it[3] != null && it[6] != null }
-      .map { sample, meta, vep, cons, tbi, exo, bam, bai ->
-             tuple(meta, vep, cons, tbi, exo ?: no_file_sb, bam, bai) }
+      .map { sample, meta, vep, cons, tbi, exo, bam ->
+             tuple(meta, vep, cons, tbi, exo ?: no_file_sb, bam) }
 
     StrandBiasPileup(sb_input_ch, norm_fasta_ch, norm_fai_ch)
     StrandBiasTest(StrandBiasPileup.out, strand_bias_script_ch)
