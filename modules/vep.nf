@@ -539,13 +539,19 @@ process MergeVariantsTable {
   input:
     path xlsx
     each path(script)
+    // Staged explicitly. The script's default path is ../data relative to
+    // itself, which resolves when run from a checkout but not in a container
+    // where only the script is staged -- there load_mane() finds nothing and
+    // silently leaves off-panel transcripts as Ensembl ENST.
+    each path(mane)
   output:
     path "genetic_variants_all_samples.xlsx", emit: table
   script:
   """
   python ${script} ${xlsx} \\
     --out genetic_variants_all_samples.xlsx \\
-    --filter ${params.merge_filter}
+    --filter ${params.merge_filter} \\
+    --mane ${mane}
   """
 }
 
@@ -776,5 +782,8 @@ workflow POST_SAREK {
 
     // collect() so this fires once, with every sample's workbook staged.
     merge_script_ch = Channel.fromPath("${params.scriptdir}/merge_reportable_variants.py").first()
-    MergeVariantsTable(LeanReport.out.map { meta, xlsx -> xlsx }.collect(), merge_script_ch)
+    mane_map_ch = Channel.fromPath("${workflow.projectDir}/data/mane_enst_to_refseq.tsv",
+                                   checkIfExists: true).first()
+    MergeVariantsTable(LeanReport.out.map { meta, xlsx -> xlsx }.collect(),
+                       merge_script_ch, mane_map_ch)
 }
