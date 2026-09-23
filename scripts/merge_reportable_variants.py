@@ -53,7 +53,7 @@ DEFAULT_MANE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 OUT_COLS = [
     "Case #", "Case ID", "Gene", "Variant", "HGVSc", "MANE_Select",
     "Panel",
-    "HGVSp", "Consequence", "Zygosity", "ClinVar", "ClinVar_Stars", "gnomAD_AF",
+    "HGVSp", "Consequence", "Zygosity", "VAF", "ClinVar", "ClinVar_Stars", "gnomAD_AF",
     "StrandBias", "Exo_Rank", "Exo_Score", "Exo_Disease",
     "Ranked_By", "Scope",
 ]
@@ -175,6 +175,13 @@ def rows_superset(xl, mane, reportable_sheet):
     happened to rank them, and add the off-panel hits Exomiser found on top.
     """
     exo = exomiser_lookup(xl)
+    # VAF comes from 'PASS variants', never from a Reportable sheet's own
+    # AD_Ref/AD_Alt. Those are the SPLIT depths after `bcftools norm -m -any`
+    # -- [ref, this_alt] -- so alt/(ref+alt) drops the sibling allele at a
+    # multiallelic site: MSH2 chr2:47414420 reads 0.795 that way against a true
+    # site fraction of 0.337. The PASS sheet's VAF is recomputed against
+    # AD_ref + sum(every ALT's AD) and is the correct one.
+    panel = panel_lookup(xl)
     out, seen = [], {}
 
     for sheet, tag in ((ACMG, "ACMG SF"), (reportable_sheet, "HemOnc")):
@@ -198,6 +205,7 @@ def rows_superset(xl, mane, reportable_sheet):
                 "MANE_Select": r.get("MANE_ID"),
                 "Consequence": r.get("Consequence"),
                 "Zygosity": r.get("Zygosity"),
+                "VAF": (panel[key].get("VAF") if key in panel else r.get("VAF")),
                 "ClinVar": r.get("ClinVar"),
                 "ClinVar_Stars": r.get("ClinVar_Stars"),
                 "gnomAD_AF": r.get("gnomAD_AF"),
@@ -228,6 +236,9 @@ def rows_superset(xl, mane, reportable_sheet):
                 "MANE_Select": to_refseq(tx, r.get("Gene"), mane),
                 "Consequence": r.get("Consequence"),
                 "Zygosity": r.get("Genotype"),
+                # Off-panel variants never reach PASS variants (BedFilterVCF
+                # removed them before annotation), so there is no caller VAF.
+                "VAF": (panel[key].get("VAF") if key in panel else r.get("VAF")),
                 "ClinVar": r.get("ClinVar"),
                 "ClinVar_Stars": r.get("ClinVar_Stars"),
                 "gnomAD_AF": None,

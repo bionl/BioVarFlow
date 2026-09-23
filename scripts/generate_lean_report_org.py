@@ -34,6 +34,12 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--sites-vcf", default=None,
+               help="StrandBiasPileup's <sample>_sb_sites.vcf.gz -- the unfiltered consensus "
+                    "subset to panel + Exomiser positions. The only source of FORMAT/AD for "
+                    "OFF-panel variants, which never reach PASS variants because BedFilterVCF "
+                    "removes them before annotation. Used to give the Exomiser and Prioritised "
+                    "tabs a VAF.")
 p.add_argument("--exomiser", default=None,
                help="Exomiser <sample>_exomiser.variants.tsv. Adds an 'Exomiser' tab and a "
                     "'Prioritised' tab. A zero-byte NO_FILE placeholder means Exomiser did not "
@@ -361,6 +367,8 @@ def read_acmg_thresholds(th_path, sf_genes=None):
 
 
 import os
+import collections
+import gzip
 import pandas as pd
 
 def acmg_pct_regions_covered(th_path, min_depth=20, gene_set=None, key_prefix="ACMG"):
@@ -1065,6 +1073,51 @@ EXOMISER_COLS = [
 ]
 
 
+
+def load_sites_vaf(path):
+    """{(chrom,pos,ref,alt): VAF} from the strand-bias sites VCF.
+
+    Computed against SITE-level depth, not per record. The consensus is already
+    split by `norm -m -any`, so each record carries AD=[ref, this_alt] and
+    alt/(ref+alt) would drop the sibling allele at a 1/2 site -- the same error
+    the multiallelic reconciliation pass exists to correct, and the one that let
+    18 sub-20% rows through the VAF floor. Records are therefore grouped by
+    position and the denominator is AD_ref + every ALT's AD.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    recs = collections.defaultdict(list)
+    try:
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 10:
+                    continue
+                keys = f[8].split(":")
+                if "AD" not in keys:
+                    continue
+                try:
+                    ad = [int(x) for x in f[9].split(":")[keys.index("AD")].split(",")]
+                except ValueError:
+                    continue
+                if len(ad) < 2:
+                    continue
+                recs[(f[0], f[1])].append((f[3].upper(), f[4].upper(), ad))
+    except OSError:
+        return {}
+
+    out = {}
+    for (chrom, pos), rows in recs.items():
+        site = rows[0][2][0] + sum(r[2][1] for r in rows)   # AD_ref + all ALTs
+        if site <= 0:
+            continue
+        for ref, alt, ad in rows:
+            out[(chrom, pos, ref, alt)] = round(ad[1] / site, 4)
+    return out
+
 def load_strand_bias(path):
     """{(chrom, pos, ref, alt): row} from strand_bias.py's TSV."""
     if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -1079,7 +1132,7 @@ def load_strand_bias(path):
     return {(r["CHROM"], r["POS"], r["REF"], r["ALT"]): r for _, r in sb.iterrows()}
 
 
-def attach_strand_bias(view, sb):
+def attach_strand_bias(view, sb, vaf=None):
     """Add the strand-bias columns to an Exomiser view, keyed on Variant.
 
     The check now runs on the RAW BAM over the union of panel and
@@ -1088,10 +1141,15 @@ def attach_strand_bias(view, sb):
     contain their reads, and an empty cell reads as "clean" to a reviewer --
     which is exactly the failure the status labels exist to prevent.
     """
-    cols = {"ALT_FWD": [], "ALT_REV": [], "StrandBias_P": [], "StrandBias": []}
+    vaf = vaf or {}
+    cols = {"VAF": [], "ALT_FWD": [], "ALT_REV": [], "StrandBias_P": [], "StrandBias": []}
     for v in view["Variant"].astype(str):
         parts = v.split(":")
-        row = sb.get(tuple(parts)) if len(parts) == 4 else None
+        key = tuple(parts) if len(parts) == 4 else None
+        # VAF for these tabs comes from the sites VCF, which covers off-panel
+        # variants too; PASS variants holds only the panel ones.
+        cols["VAF"].append(vaf.get(key, pd.NA))
+        row = sb.get(key) if key else None
         if row is None:
             cols["ALT_FWD"].append(pd.NA); cols["ALT_REV"].append(pd.NA)
             cols["StrandBias_P"].append(pd.NA)
@@ -1197,6 +1255,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
 
     variant_cols = [
         "Gene","Variant","HGVSc","HGVSp","MANE_ID","Zygosity","GT","AD_Ref","AD_Alt","DP","GQ","QUAL",
+        "VAF",
         "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
         # Raw-alignment strand bias: advisory, never a filter. See strand_bias.py.
         "ALT_FWD","ALT_REV","StrandBias_P","StrandBias","QC_Flags"
@@ -1260,11 +1319,16 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
                 if "ClinVar" in variants.columns else pd.Series(False, index=variants.index))
 
         if report_min_vaf > 0:
-            # VAF recomputed from AD rather than read from FORMAT/VAF, which is
-            # still wrong at multiallelic sites (see the reconciliation pass).
-            _ar = pd.to_numeric(variants.get("AD_Ref"), errors="coerce")
-            _aa = pd.to_numeric(variants.get("AD_Alt"), errors="coerce")
-            _vaf = _aa / (_ar + _aa)
+            # Use df["VAF"], the value the multiallelic reconciliation pass
+            # already computed against site-level depth (AD_ref + every ALT's
+            # AD). Recomputing AD_Alt/(AD_Ref+AD_Alt) here instead reproduces
+            # the very bug that pass exists to fix: after `norm -m -any` those
+            # are the SPLIT depths, so at a 1/2 site the sibling allele is
+            # missing from the denominator and the ratio is inflated. That let
+            # 18 het(1/2) rows with a true VAF of 0.08-0.20 through the floor,
+            # each displaying a VAF below the threshold that had supposedly
+            # removed it.
+            _vaf = pd.to_numeric(variants.get("VAF"), errors="coerce")
             # NaN VAF (missing AD) is kept: absence of evidence is not evidence
             # to drop a variant from a clinical sheet.
             variants = variants[~((_vaf < report_min_vaf) & ~_plp) | _vaf.isna()]
@@ -1361,7 +1425,8 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     _exo = load_exomiser(args.exomiser)
     if _exo is not None:
         _sb_map = load_strand_bias(args.strand_bias)
-        _view = attach_strand_bias(exomiser_view(_exo), _sb_map)
+        _vaf_map = load_sites_vaf(args.sites_vcf)
+        _view = attach_strand_bias(exomiser_view(_exo), _sb_map, _vaf_map)
         if args.exomiser_top and args.exomiser_top > 0:
             _view = _view.head(args.exomiser_top)
         _view.to_excel(xw, index=False, sheet_name="Exomiser")
@@ -1380,7 +1445,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
             if "Variant" in _rs.columns:
                 _rep.update(_rs["Variant"].astype(str))
 
-        _p = attach_strand_bias(exomiser_view(_exo), _sb_map).copy()
+        _p = attach_strand_bias(exomiser_view(_exo), _sb_map, _vaf_map).copy()
         _p.insert(0, "Source",
                   _p["Variant"].map(lambda v: "PANEL+EXOMISER" if v in _rep else "EXOMISER_ONLY"))
         _comb = pd.to_numeric(_p["Combined_Score"], errors="coerce").fillna(0)

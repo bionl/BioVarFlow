@@ -454,7 +454,9 @@ process StrandBiasTest {
     tuple val(meta), path(pileup), path(vcf)
     each path(script)
   output:
-    tuple val(meta), path("${meta.sample}_strand_bias.tsv")
+    // The sites VCF rides along: it is the only source of FORMAT/AD for
+    // off-panel variants, and LeanReport needs it to give them a VAF.
+    tuple val(meta), path("${meta.sample}_strand_bias.tsv"), path(vcf)
   script:
     def sample = meta.sample
   """
@@ -566,7 +568,7 @@ process LeanReport {
           path(sex_check),
           path(gaps20), path(gaps30),
           path(thresholds),
-          path(strand_bias),
+          path(strand_bias), path(sites_vcf),
           path(exomiser_tsv)
     each path(script)
     each path(sf_genes_file)
