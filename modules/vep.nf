@@ -573,6 +573,7 @@ process LeanReport {
     each path(script)
     each path(sf_genes_file)
     each path(hemonc_genes_file)
+    each path(mane_map)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants.xlsx")
   script:
@@ -590,6 +591,8 @@ process LeanReport {
     --hemonc-genes ${hemonc_genes_file} \
     --gaps20 ${gaps20} --gaps30 ${gaps30} \
     --strand-bias ${strand_bias} \
+    --sites-vcf ${sites_vcf} \
+    --mane ${mane_map} \
     --exomiser ${exomiser_tsv} \
     --exomiser-top ${params.exomiser_top}
   """
@@ -773,19 +776,21 @@ workflow POST_SAREK {
     // keeps LeanReport running for samples Exomiser skipped, and -- with
     // errorStrategy 'ignore' on EXOMISER_BATCH -- keeps a failed Exomiser from
     // costing the reports entirely. The workbook simply omits the two tabs.
+    // Defined here because both LeanReport (off-panel transcripts on the
+    // Prioritised sheet) and MergeVariantsTable consume it.
+    mane_map_ch = Channel.fromPath("${workflow.projectDir}/data/mane_enst_to_refseq.tsv",
+                                   checkIfExists: true).first()
     no_exomiser = file("${workflow.projectDir}/assets/NO_FILE")
     lean_with_exo_ch = lean_input_ch
       .map { tup -> tuple(tup[0].sample, tup) }
       .join(exomiser_ch, remainder: true)
       .filter { s, tup, exo -> tup != null }
       .map    { s, tup, exo -> tup + [ exo ?: no_exomiser ] }
-    LeanReport(lean_with_exo_ch, script_ch, sf_genes_ch, hemonc_genes_ch)
+    LeanReport(lean_with_exo_ch, script_ch, sf_genes_ch, hemonc_genes_ch, mane_map_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 
     // collect() so this fires once, with every sample's workbook staged.
     merge_script_ch = Channel.fromPath("${params.scriptdir}/merge_reportable_variants.py").first()
-    mane_map_ch = Channel.fromPath("${workflow.projectDir}/data/mane_enst_to_refseq.tsv",
-                                   checkIfExists: true).first()
     MergeVariantsTable(LeanReport.out.map { meta, xlsx -> xlsx }.collect(),
                        merge_script_ch, mane_map_ch)
 }

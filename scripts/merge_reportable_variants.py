@@ -160,6 +160,29 @@ def exomiser_lookup(xl):
     return {str(r["Variant"]): r for _, r in ex.iterrows()}
 
 
+def rows_from_prioritised_superset(df, mane):
+    """Prioritised sheet -> merged-table rows, as-is.
+
+    The sheet already carries Scope/Panel and every column the deliverable
+    needs, so this is a rename rather than a rebuild.
+    """
+    out = []
+    for _, r in df.iterrows():
+        out.append({
+            "Scope": r.get("Scope"), "Panel": r.get("Panel"),
+            "Gene": r.get("Gene"), "Variant": r.get("Variant"),
+            "HGVSc": r.get("HGVSc"), "HGVSp": r.get("HGVSp"),
+            "MANE_Select": to_refseq(r.get("MANE_Select"), r.get("Gene"), mane),
+            "Consequence": r.get("Consequence"), "Zygosity": r.get("Zygosity"),
+            "VAF": r.get("VAF"),
+            "ClinVar": r.get("ClinVar"), "ClinVar_Stars": r.get("ClinVar_Stars"),
+            "gnomAD_AF": r.get("gnomAD_AF"), "StrandBias": r.get("StrandBias"),
+            "Exo_Rank": r.get("Exo_Rank"), "Exo_Score": r.get("Exo_Score"),
+            "Exo_Disease": r.get("Exo_Disease"),
+        })
+    return out
+
+
 def rows_superset(xl, mane, reportable_sheet):
     """Every Reportable variant, plus Exomiser's off-panel hits.
 
@@ -380,8 +403,14 @@ def main():
         rep = xl.get(args.reportable_sheet)
 
         if args.source == "auto":
-            # Superset: every Reportable variant plus Exomiser's off-panel hits.
-            rows = rows_superset(xl, mane, args.reportable_sheet)
+            # The Prioritised sheet is now itself the superset -- every
+            # Reportable variant plus Exomiser's off-panel hits, VAF floor
+            # applied across both -- so it is the single reference this merge
+            # reads. Rebuilding the union here would risk the two definitions
+            # drifting apart.
+            rows = (rows_from_prioritised_superset(pri, mane)
+                    if pri is not None and len(pri) and "Scope" in pri.columns
+                    else rows_superset(xl, mane, args.reportable_sheet))
             ranked_by = ("exomiser" if (pri is not None and len(pri)) else "panel_only")
             src_df = rep
             if not rows and rep is None:

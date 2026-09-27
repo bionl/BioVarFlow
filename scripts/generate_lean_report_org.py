@@ -34,6 +34,11 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--mane", default=None,
+               help="TSV mapping Ensembl transcripts to RefSeq (ENST<tab>NM_<tab>symbol), from "
+                    "the NCBI MANE summary. Off-panel variants never reach VEP, so Exomiser's "
+                    "Ensembl accession is all we have for them; interpretation is done against "
+                    "RefSeq.")
 p.add_argument("--sites-vcf", default=None,
                help="StrandBiasPileup's <sample>_sb_sites.vcf.gz -- the unfiltered consensus "
                     "subset to panel + Exomiser positions. The only source of FORMAT/AD for "
@@ -1074,6 +1079,44 @@ EXOMISER_COLS = [
 
 
 
+def load_mane(path):
+    """{ENST without version: (RefSeq_nuc, symbol)} from the MANE summary."""
+    out = {}
+    if not path or not os.path.exists(path):
+        return out
+    with open(path) as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 3 and f[0].startswith("ENST"):
+                out[f[0].split(".")[0]] = (f[1], f[2])
+    return out
+
+
+def split_exomiser_hgvs(value):
+    """Exomiser's GENE:TRANSCRIPT:c.:p. field -> (transcript, c., p.)."""
+    tx = c = pr = None
+    for part in str(value or "").split(":"):
+        if part.startswith("ENST") or part.startswith("NM_"):
+            tx = part
+        elif part.startswith("c."):
+            c = part
+        elif part.startswith("p."):
+            pr = part
+    return tx, c, pr
+
+
+def to_refseq(tx, gene, mane):
+    """ENST -> MANE Select RefSeq, only when the gene symbol agrees.
+
+    A silent swap to the wrong transcript is worse than an ENST a reviewer can
+    look up, so a symbol mismatch leaves the accession untouched.
+    """
+    if not tx or not str(tx).startswith("ENST"):
+        return tx
+    hit = mane.get(str(tx).split(".")[0])
+    return hit[0] if hit and (not gene or str(gene) == hit[1]) else tx
+
+
 def load_sites_vaf(path):
     """{(chrom,pos,ref,alt): VAF} from the strand-bias sites VCF.
 
@@ -1331,18 +1374,29 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
             _vaf = pd.to_numeric(variants.get("VAF"), errors="coerce")
             # NaN VAF (missing AD) is kept: absence of evidence is not evidence
             # to drop a variant from a clinical sheet.
-            variants = variants[~((_vaf < report_min_vaf) & ~_plp) | _vaf.isna()]
+            # The VAF floor applies to EVERY variant, P/LP included. A
+            # pathogenic call below the floor is still a call we cannot stand
+            # behind at that allele fraction, and reporting it on the strength
+            # of its ClinVar label alone would put the weakest evidence in the
+            # sheet under the strongest heading. The gnomAD gate keeps its P/LP
+            # exemption -- being common in a founder population is a different
+            # argument from being thinly supported in this sample.
+            variants = variants[~(_vaf < report_min_vaf) | _vaf.isna()]
 
         if report_max_af < 1:
+            # Applied to EVERY variant, P/LP included. Note this also removes a
+            # pathogenic variant that is common in a specific population -- the
+            # founder case BS1/BA1 exists for. That is the intended behaviour
+            # here, but it is the one place this gate can drop something a
+            # reviewer would want to see.
             _af = pd.to_numeric(variants.get("gnomAD_AF"), errors="coerce")
-            _plp2 = _plp.reindex(variants.index, fill_value=False)
             # Absent from gnomAD (NaN) means rare, so it is kept.
-            variants = variants[~((_af >= report_max_af) & ~_plp2)]
+            variants = variants[~(_af >= report_max_af)]
 
         if gene_set:
             variants = variants[variants["Gene"].isin(gene_set)]
         variants[variant_cols].to_excel(xw, index=False, sheet_name=variants_sheet)
-        reportable_sheets.append(variants)
+        reportable_sheets.append((variants_sheet, variants))
 
         # ---- coverage gaps sheet ----
         combined = pd.DataFrame(columns=empty_gaps_cols)
@@ -1431,26 +1485,111 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
             _view = _view.head(args.exomiser_top)
         _view.to_excel(xw, index=False, sheet_name="Exomiser")
 
-        # Prioritised: the two views reconciled.
-        #   PANEL+EXOMISER  on a Reportable sheet AND ranked by Exomiser -- the
-        #                   strongest signal, agreed by both a curated panel and
-        #                   a phenotype model that never saw the panel.
-        #   EXOMISER_ONLY   off-panel but highly ranked. Kept because the panel
-        #                   is 285 genes and Exomiser searches the exome: on
-        #                   IQMM the top hits included NUP214 (pheno 0.952) and
-        #                   ANAPC1 (stop_gained), neither on the panel. Dropping
-        #                   them would discard the reason Exomiser is run.
-        _rep = set()
-        for _rs in reportable_sheets:
-            if "Variant" in _rs.columns:
-                _rep.update(_rs["Variant"].astype(str))
+        # ---- Prioritised: everything we intend to report, in one sheet ----
+        #
+        # A SUPERSET, not an intersection. It was previously built only from
+        # Exomiser's output, which filters before it ranks -- ~570 of ~240,000
+        # variants survive, with intronic, synonymous and common ones dropped.
+        # That left 27 of 29 HemOnc and 17 of 22 ACMG SF Reportable variants off
+        # the sheet entirely, including a Pathogenic GATA2. Panel membership
+        # already justifies a row; Exomiser is supporting evidence, not a gate.
+        #
+        #   PANEL_REPORTABLE  every row of both Reportable sheets, with the
+        #                     Exomiser rank/score attached where it ranked them
+        #                     and blank where it did not
+        #   OFF_PANEL         Exomiser hits outside the 285 genes, above
+        #                     --prioritised-min-score
+        #
+        # This sheet is the single reference the cross-case merge reads, so
+        # anything that should reach the deliverable has to be here.
+        _mane = load_mane(args.mane)
+        _exo_by_variant = {str(r["Variant"]): r for _, r in exomiser_view(_exo).iterrows()}
+        _sb_by_variant  = {str(r["Variant"]): r
+                           for _, r in attach_strand_bias(exomiser_view(_exo),
+                                                          _sb_map, _vaf_map).iterrows()}
 
-        _p = attach_strand_bias(exomiser_view(_exo), _sb_map, _vaf_map).copy()
-        _p.insert(0, "Source",
-                  _p["Variant"].map(lambda v: "PANEL+EXOMISER" if v in _rep else "EXOMISER_ONLY"))
-        _comb = pd.to_numeric(_p["Combined_Score"], errors="coerce").fillna(0)
-        _keep = (_p["Source"] == "PANEL+EXOMISER") | (_comb >= args.prioritised_min_score)
-        _p = _p[_keep]
+        _rows, _seen = [], {}
+        for _sheet_name, _rs in reportable_sheets:
+            _tag = "ACMG SF" if _sheet_name.startswith("ACMG") else "HemOnc"
+            for _, r in _rs.iterrows():
+                _key = str(r.get("Variant"))
+                if _key in _seen:                 # genes listed on both panels
+                    if _tag not in _seen[_key]["Panel"]:
+                        _seen[_key]["Panel"] += "+" + _tag
+                    continue
+                _e = _exo_by_variant.get(_key)
+                _row = {
+                    "Scope": "PANEL_REPORTABLE", "Panel": _tag,
+                    "Gene": r.get("Gene"), "Variant": r.get("Variant"),
+                    "HGVSc": r.get("HGVSc"), "HGVSp": r.get("HGVSp"),
+                    "MANE_Select": r.get("MANE_ID"),
+                    "Consequence": r.get("Consequence"), "Zygosity": r.get("Zygosity"),
+                    "VAF": r.get("VAF"),
+                    "ClinVar": r.get("ClinVar"), "ClinVar_Stars": r.get("ClinVar_Stars"),
+                    "gnomAD_AF": r.get("gnomAD_AF"),
+                    "ALT_FWD": r.get("ALT_FWD"), "ALT_REV": r.get("ALT_REV"),
+                    "StrandBias_P": r.get("StrandBias_P"), "StrandBias": r.get("StrandBias"),
+                    "MOI": _e.get("MOI") if _e is not None else None,
+                    "Exo_Rank": _e.get("Rank") if _e is not None else None,
+                    "Exo_Score": _e.get("Combined_Score") if _e is not None else None,
+                    "Exo_Disease": _e.get("Exomiser_Disease") if _e is not None else None,
+                }
+                _seen[_key] = _row
+                _rows.append(_row)
+
+        _comb_all = pd.to_numeric(exomiser_view(_exo)["Combined_Score"], errors="coerce")
+        for _idx, _e in exomiser_view(_exo).iterrows():
+            _key = str(_e["Variant"])
+            if _key in _seen:
+                continue
+            if not (pd.notna(_comb_all[_idx]) and _comb_all[_idx] >= args.prioritised_min_score):
+                continue
+            _tx, _c, _pr = split_exomiser_hgvs(_e.get("HGVS"))
+            _sb = _sb_by_variant.get(_key)
+            _rows.append({
+                "Scope": "OFF_PANEL", "Panel": "",
+                "Gene": _e.get("Gene"), "Variant": _e.get("Variant"),
+                "HGVSc": _c, "HGVSp": _pr,
+                "MANE_Select": to_refseq(_tx, _e.get("Gene"), _mane),
+                "Consequence": _e.get("Consequence"), "Zygosity": _e.get("Genotype"),
+                "VAF": (_sb.get("VAF") if _sb is not None else None),
+                "ClinVar": _e.get("ClinVar"), "ClinVar_Stars": _e.get("ClinVar_Stars"),
+                # Exomiser reports MAX_FREQ as a PERCENTAGE, and across all its
+                # frequency sources rather than gnomAD alone -- close enough in
+                # purpose to gate on, but not the identical quantity the panel
+                # rows carry.
+                "gnomAD_AF": (float(_e["Max_Freq_pct"]) / 100.0
+                              if pd.notna(_e.get("Max_Freq_pct"))
+                              and str(_e.get("Max_Freq_pct")).strip() != "" else None),
+                "ALT_FWD": (_sb.get("ALT_FWD") if _sb is not None else None),
+                "ALT_REV": (_sb.get("ALT_REV") if _sb is not None else None),
+                "StrandBias_P": (_sb.get("StrandBias_P") if _sb is not None else None),
+                "StrandBias": (_sb.get("StrandBias") if _sb is not None else None),
+                "MOI": _e.get("MOI"),
+                "Exo_Rank": _e.get("Rank"), "Exo_Score": _e.get("Combined_Score"),
+                "Exo_Disease": _e.get("Exomiser_Disease"),
+            })
+
+        _p = pd.DataFrame(_rows, columns=[
+            "Scope", "Panel", "Gene", "Variant", "HGVSc", "HGVSp", "MANE_Select",
+            "Consequence", "Zygosity", "VAF", "ClinVar", "ClinVar_Stars", "gnomAD_AF",
+            "ALT_FWD", "ALT_REV", "StrandBias_P", "StrandBias",
+            "MOI", "Exo_Rank", "Exo_Score", "Exo_Disease"])
+
+        # The VAF floor applies to the WHOLE sheet -- off-panel included, and
+        # with no P/LP exemption. A variant we cannot support at the read level
+        # should not appear because of its ClinVar label.
+        if len(_p) and args.report_min_vaf > 0:
+            _pv = pd.to_numeric(_p["VAF"], errors="coerce")
+            _p = _p[~(_pv < args.report_min_vaf) | _pv.isna()]
+
+        # Same population gate as the Reportable sheets, applied here too so the
+        # off-panel rows are held to it as well. Absent frequency = rare = kept.
+        if len(_p) and args.report_max_af < 1:
+            _pa = pd.to_numeric(_p["gnomAD_AF"], errors="coerce")
+            _p = _p[~(_pa >= args.report_max_af)]
+
+        _p = _p.sort_values(["Scope", "Exo_Rank", "Gene"], kind="stable")
         _p.to_excel(xw, index=False, sheet_name="Prioritised")
 
 print(f"Wrote Excel report → {args.xlsx_out}")
