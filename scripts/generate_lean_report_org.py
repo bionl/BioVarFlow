@@ -30,6 +30,36 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--mane", default=None,
+               help="TSV mapping Ensembl transcripts to RefSeq (ENST<tab>NM_<tab>symbol), from "
+                    "the NCBI MANE summary. Off-panel variants never reach VEP, so Exomiser's "
+                    "Ensembl accession is all we have for them; interpretation is done against "
+                    "RefSeq.")
+p.add_argument("--sites-vcf", default=None,
+               help="StrandBiasPileup's <sample>_sb_sites.vcf.gz -- the unfiltered consensus "
+                    "subset to panel + Exomiser positions. The only source of FORMAT/AD for "
+                    "OFF-panel variants, which never reach PASS variants because BedFilterVCF "
+                    "removes them before annotation. Used to give the Exomiser and Prioritised "
+                    "tabs a VAF.")
+p.add_argument("--exomiser", default=None,
+               help="Exomiser <sample>_exomiser.variants.tsv. Adds an 'Exomiser' tab and a "
+                    "'Prioritised' tab. A zero-byte NO_FILE placeholder means Exomiser did not "
+                    "run for this sample and both tabs are skipped.")
+p.add_argument("--exomiser-top", type=int, default=0,
+               help="Rows kept on the Exomiser tab, by rank. 0 (the default) keeps every variant "
+                    "Exomiser emitted -- 745 for IQMM. Set a positive number to cap the tab; the "
+                    "full TSV and HTML are published under <outdir>/exomiser either way.")
+p.add_argument("--panel-genes", default=None,
+               help="Gene symbols on the capture panel, one per line. Used ONLY to split the "
+                    "Prioritised tab into PANEL_VUS and OFF_PANEL -- unlike --sf-genes it does "
+                    "not filter any sheet. Without it the panel is inferred from the genes "
+                    "present in this sample's report, which misses panel genes the sample has "
+                    "no calls in.")
+p.add_argument("--prioritised-min-score", type=float, default=0.05,
+               help="Prioritised tab: minimum Exomiser combined score for an OFF-panel variant "
+                    "to be listed (default 0.05). Panel variants ranked by Exomiser are always "
+                    "listed regardless of score. Set very high to make the tab a pure "
+                    "panel/Exomiser intersection.")
 p.add_argument("--strand-bias", default=None,
                help="strand_bias.py TSV: per-variant ALT_FWD/ALT_REV and Fisher p from the raw alignment")
 
@@ -491,6 +521,202 @@ def _norm_revstat(s: str) -> str:
     s = s.lower().replace("_", " ")
     s = re.sub(r"\s+", " ", s)
     return s
+
+EXOMISER_COLS = [
+    ("#RANK",                          "Rank"),
+    ("GENE_SYMBOL",                    "Gene"),
+    ("HGVS",                           "HGVS"),
+    ("GENOTYPE",                       "Genotype"),
+    ("FUNCTIONAL_CLASS",               "Consequence"),
+    ("MOI",                            "MOI"),
+    ("EXOMISER_GENE_COMBINED_SCORE",   "Combined_Score"),
+    ("EXOMISER_GENE_PHENO_SCORE",      "Pheno_Score"),
+    ("EXOMISER_VARIANT_SCORE",         "Variant_Score"),
+    ("CONTRIBUTING_VARIANT",           "Contributing"),
+    ("EXOMISER_ACMG_CLASSIFICATION",   "Exomiser_ACMG"),
+    ("EXOMISER_ACMG_DISEASE_NAME",     "Exomiser_Disease"),
+    ("CLINVAR_PRIMARY_INTERPRETATION", "ClinVar"),
+    ("CLINVAR_STAR_RATING",            "ClinVar_Stars"),
+    ("MAX_FREQ",                       "Max_Freq_pct"),
+    ("GENE_CONSTRAINT_LOEUF",          "LOEUF"),
+]
+
+
+def load_mane(path):
+    """{ENST without version: (RefSeq_nuc, symbol)} from the MANE summary."""
+    out = {}
+    if not path or not os.path.exists(path):
+        return out
+    with open(path) as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 3 and f[0].startswith("ENST"):
+                out[f[0].split(".")[0]] = (f[1], f[2])
+    return out
+
+
+def split_exomiser_hgvs(value):
+    """Exomiser's GENE:TRANSCRIPT:c.:p. field -> (transcript, c., p.)."""
+    tx = c = pr = None
+    for part in str(value or "").split(":"):
+        if part.startswith("ENST") or part.startswith("NM_"):
+            tx = part
+        elif part.startswith("c."):
+            c = part
+        elif part.startswith("p."):
+            pr = part
+    return tx, c, pr
+
+
+def to_refseq(tx, gene, mane):
+    """ENST -> MANE Select RefSeq, only when the gene symbol agrees.
+
+    A silent swap to the wrong transcript is worse than an ENST a reviewer can
+    look up, so a symbol mismatch leaves the accession untouched.
+    """
+    if not tx or not str(tx).startswith("ENST"):
+        return tx
+    hit = mane.get(str(tx).split(".")[0])
+    return hit[0] if hit and (not gene or str(gene) == hit[1]) else tx
+
+
+def load_sites_vaf(path):
+    """{(chrom,pos,ref,alt): VAF} from the strand-bias sites VCF.
+
+    Computed against SITE-level depth, not per record. The consensus is already
+    split by `norm -m -any`, so each record carries AD=[ref, this_alt] and
+    alt/(ref+alt) would drop the sibling allele at a 1/2 site -- the same error
+    the multiallelic reconciliation pass exists to correct, and the one that let
+    18 sub-20% rows through the VAF floor. Records are therefore grouped by
+    position and the denominator is AD_ref + every ALT's AD.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    recs = collections.defaultdict(list)
+    try:
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 10:
+                    continue
+                keys = f[8].split(":")
+                if "AD" not in keys:
+                    continue
+                try:
+                    ad = [int(x) for x in f[9].split(":")[keys.index("AD")].split(",")]
+                except ValueError:
+                    continue
+                if len(ad) < 2:
+                    continue
+                recs[(f[0], f[1])].append((f[3].upper(), f[4].upper(), ad))
+    except OSError:
+        return {}
+
+    out = {}
+    for (chrom, pos), rows in recs.items():
+        site = rows[0][2][0] + sum(r[2][1] for r in rows)   # AD_ref + all ALTs
+        if site <= 0:
+            continue
+        for ref, alt, ad in rows:
+            out[(chrom, pos, ref, alt)] = round(ad[1] / site, 4)
+    return out
+
+
+def load_strand_bias(path):
+    """{(chrom, pos, ref, alt): row} from strand_bias.py's TSV."""
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    try:
+        sb = pd.read_csv(path, sep="\t", dtype=str)
+    except Exception:
+        return {}
+    if "StrandBias_Flag" not in sb.columns:
+        return {}
+    sb = sb.drop_duplicates(subset=["CHROM", "POS", "REF", "ALT"])
+    return {(r["CHROM"], r["POS"], r["REF"], r["ALT"]): r for _, r in sb.iterrows()}
+
+
+def attach_strand_bias(view, sb, vaf=None):
+    """Add the strand-bias columns to an Exomiser view, keyed on Variant.
+
+    The check now runs on the RAW BAM over the union of panel and
+    Exomiser-ranked sites, so off-panel rows get a real result instead of a
+    blank. Before that they were untestable: the panel-filtered BAM does not
+    contain their reads, and an empty cell reads as "clean" to a reviewer --
+    which is exactly the failure the status labels exist to prevent.
+    """
+    vaf = vaf or {}
+    cols = {"VAF": [], "ALT_FWD": [], "ALT_REV": [], "StrandBias_P": [], "StrandBias": []}
+    for v in view["Variant"].astype(str):
+        parts = v.split(":")
+        key = tuple(parts) if len(parts) == 4 else None
+        # VAF for these tabs comes from the sites VCF, which covers off-panel
+        # variants too; PASS variants holds only the panel ones.
+        cols["VAF"].append(vaf.get(key, pd.NA))
+        row = sb.get(key) if key else None
+        if row is None:
+            cols["ALT_FWD"].append(pd.NA); cols["ALT_REV"].append(pd.NA)
+            cols["StrandBias_P"].append(pd.NA)
+            cols["StrandBias"].append("NOT_TESTED_NO_PILEUP" if sb else "NOT_RUN")
+        else:
+            cols["ALT_FWD"].append(row["ALT_FWD"]); cols["ALT_REV"].append(row["ALT_REV"])
+            cols["StrandBias_P"].append(row["StrandBias_P"])
+            cols["StrandBias"].append(row["StrandBias_Flag"])
+    out = view.copy()
+    for k, v in cols.items():
+        out[k] = v
+    return out
+
+
+def load_exomiser(path):
+    """Exomiser variants TSV -> DataFrame, or None when it did not run.
+
+    LeanReport is handed a zero-byte assets/NO_FILE placeholder for samples
+    Exomiser skipped, so that the workbook is still produced. Treat any empty
+    or header-less file the same way.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        df = pd.read_csv(path, sep="\t", dtype=str)
+    except Exception:
+        return None
+    if "#RANK" not in df.columns or df.empty:
+        return None
+    df["Variant"] = ("chr" + df["CONTIG"].astype(str).str.removeprefix("chr")
+                     + ":" + df["START"].astype(str)
+                     + ":" + df["REF"].astype(str) + ":" + df["ALT"].astype(str))
+    df["_rank"] = pd.to_numeric(df["#RANK"], errors="coerce")
+    return df.sort_values("_rank", kind="stable")
+
+
+def exomiser_view(df):
+    """Rename to the reviewer-facing columns, keeping only those present."""
+    cols = [(src, dst) for src, dst in EXOMISER_COLS if src in df.columns]
+    out = df[["Variant"] + [c for c, _ in cols]].copy()
+    out = out.rename(columns=dict(cols))
+    return out[["Rank", "Gene", "Variant"] +
+               [d for _, d in cols if d not in ("Rank", "Gene")]]
+
+
+def is_pathogenic_clinvar(clinvar_val):
+    """
+    True only for an exact Pathogenic / Likely_pathogenic classification
+    (including combined "Pathogenic/Likely_pathogenic" or "Pathogenic&Likely_pathogenic").
+    Rejects substring-adjacent but distinct terms like
+    "Conflicting_classifications_of_pathogenicity" or "risk_factor".
+    """
+    if not clinvar_val:
+        return False
+    exact = {"pathogenic", "likely pathogenic"}
+    for tok in re.split(r"[&/|,]", str(clinvar_val)):
+        if tok.strip().lower().replace("_", " ") in exact:
+            return True
+    return False
+
 
 def clinvar_stars_from_revstat(revstat: str) -> int:
     """
@@ -976,6 +1202,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "ALT_FWD","ALT_REV","StrandBias_P","StrandBias","QC_Flags"
     ]
     acmg[acmg_cols].to_excel(xw, index=False, sheet_name="ACMG SF (P-LP)")
+    _reportable = acmg          # kept for the Prioritised sheet below
 
     # 3) Coverage gaps in ACMG SF genes (or all genes if no list)
     combined_df = pd.DataFrame(columns=[
@@ -1028,5 +1255,122 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "ALT_FWD","ALT_REV","StrandBias_P","StrandBias","QC_Flags"
     ]
     df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
+
+    # ---- Exomiser + Prioritised -------------------------------------------
+    # Exomiser ranks the WHOLE callset against the patient's HPO terms,
+    # including genes outside ACMG SF -- it runs on the unfiltered consensus,
+    # not the panel-filtered VCF this report is built from.
+    _exo = load_exomiser(args.exomiser)
+    if _exo is not None:
+        _sb_map  = load_strand_bias(args.strand_bias)
+        _vaf_map = load_sites_vaf(args.sites_vcf)
+        _mane    = load_mane(args.mane)
+
+        _view = attach_strand_bias(exomiser_view(_exo), _sb_map, _vaf_map)
+        if args.exomiser_top and args.exomiser_top > 0:
+            _view = _view.head(args.exomiser_top)
+        _view.to_excel(xw, index=False, sheet_name="Exomiser")
+
+        # Prioritised: a SUPERSET, not an intersection.
+        #   PANEL_REPORTABLE  every row of the ACMG SF sheet, with the Exomiser
+        #                     rank/score attached where it ranked them and blank
+        #                     where it did not. Exomiser filters before it ranks
+        #                     -- intronic, synonymous and common variants are
+        #                     dropped -- so building this from its output alone
+        #                     would silently lose most reported variants.
+        #   OFF_PANEL         Exomiser hits outside the ACMG SF genes, scoring
+        #                     at least --prioritised-min-score.
+        # What counts as "on panel". Prefer an explicit list: --panel-genes,
+        # else --sf-genes if one was supplied. Failing both, fall back to the
+        # genes present in this report -- the BED this pipeline filters on IS
+        # the ACMG SF region set, so those genes are the panel, though a panel
+        # gene with no calls in this sample will be missing from the fallback.
+        # Exomiser sees the unfiltered consensus, so anything it names that is
+        # absent from the panel fell outside those regions.
+        _panel_label = "ACMG SF"
+        _panel_genes = set()
+        if args.panel_genes and os.path.exists(args.panel_genes):
+            with open(args.panel_genes) as _f:
+                _panel_genes = {l.split()[0] for l in _f if l.strip()}
+        _panel_genes = _panel_genes or sf_genes \
+                       or (set(df["Gene"].dropna().astype(str)) - {"", "NA"})
+
+        _exo_by_variant = {str(r["Variant"]): r for _, r in exomiser_view(_exo).iterrows()}
+        _sb_by_variant  = {str(r["Variant"]): r for _, r in _view.iterrows()}
+
+        _rows, _seen = [], set()
+        for _, r in _reportable.iterrows():
+            _key = str(r.get("Variant"))
+            if _key in _seen:
+                continue
+            _seen.add(_key)
+            _e = _exo_by_variant.get(_key)
+            _rows.append({
+                "Scope": "PANEL_REPORTABLE", "Panel": _panel_label,
+                "Gene": r.get("Gene"), "Variant": r.get("Variant"),
+                "HGVSc": r.get("HGVSc"), "HGVSp": r.get("HGVSp"),
+                "MANE_Select": r.get("MANE_ID"),
+                "Consequence": r.get("Consequence"), "Zygosity": r.get("Zygosity"),
+                "VAF": r.get("VAF"),
+                "ClinVar": r.get("ClinVar"), "ClinVar_Stars": r.get("ClinVar_Stars"),
+                "gnomAD_AF": r.get("gnomAD_AF"),
+                "ALT_FWD": r.get("ALT_FWD"), "ALT_REV": r.get("ALT_REV"),
+                "StrandBias_P": r.get("StrandBias_P"), "StrandBias": r.get("StrandBias"),
+                "MOI": _e.get("MOI") if _e is not None else None,
+                "Exo_Rank": _e.get("Rank") if _e is not None else None,
+                "Exo_Score": _e.get("Combined_Score") if _e is not None else None,
+                "Exo_Disease": _e.get("Exomiser_Disease") if _e is not None else None,
+            })
+
+        _ev = exomiser_view(_exo)
+        _comb = pd.to_numeric(_ev["Combined_Score"], errors="coerce")
+        for _i, _e in _ev.iterrows():
+            _key = str(_e["Variant"])
+            if _key in _seen:
+                continue
+            if not (pd.notna(_comb[_i]) and _comb[_i] >= args.prioritised_min_score):
+                continue
+            _tx, _c, _pr = split_exomiser_hgvs(_e.get("HGVS"))
+            _sb = _sb_by_variant.get(_key)
+            # Panel says where the GENE sits; Scope says why the row is here.
+            # An Exomiser hit in a panel gene that did not qualify for the P-LP
+            # sheet is PANEL_VUS, not OFF_PANEL -- the gene is on panel, only
+            # the variant fell short of the reportable classification.
+            _on_panel = str(_e.get("Gene")) in _panel_genes
+            _rows.append({
+                "Scope": "PANEL_VUS" if _on_panel else "OFF_PANEL",
+                "Panel": _panel_label if _on_panel else "",
+                "Gene": _e.get("Gene"), "Variant": _e.get("Variant"),
+                "HGVSc": _c, "HGVSp": _pr,
+                "MANE_Select": to_refseq(_tx, _e.get("Gene"), _mane),
+                "Consequence": _e.get("Consequence"), "Zygosity": _e.get("Genotype"),
+                "VAF": (_sb.get("VAF") if _sb is not None else None),
+                "ClinVar": _e.get("ClinVar"), "ClinVar_Stars": _e.get("ClinVar_Stars"),
+                # Exomiser reports MAX_FREQ as a PERCENTAGE, across all its
+                # frequency sources rather than gnomAD alone.
+                "gnomAD_AF": (float(_e["Max_Freq_pct"]) / 100.0
+                              if pd.notna(_e.get("Max_Freq_pct"))
+                              and str(_e.get("Max_Freq_pct")).strip() != "" else None),
+                "ALT_FWD": (_sb.get("ALT_FWD") if _sb is not None else None),
+                "ALT_REV": (_sb.get("ALT_REV") if _sb is not None else None),
+                "StrandBias_P": (_sb.get("StrandBias_P") if _sb is not None else None),
+                "StrandBias": (_sb.get("StrandBias") if _sb is not None else None),
+                "MOI": _e.get("MOI"),
+                "Exo_Rank": _e.get("Rank"), "Exo_Score": _e.get("Combined_Score"),
+                "Exo_Disease": _e.get("Exomiser_Disease"),
+            })
+
+        _prio = pd.DataFrame(_rows, columns=[
+            "Scope", "Panel", "Gene", "Variant", "HGVSc", "HGVSp", "MANE_Select",
+            "Consequence", "Zygosity", "VAF", "ClinVar", "ClinVar_Stars", "gnomAD_AF",
+            "ALT_FWD", "ALT_REV", "StrandBias_P", "StrandBias",
+            "MOI", "Exo_Rank", "Exo_Score", "Exo_Disease"])
+        # Reportable first, then on-panel VUS, then everything Exomiser pulled
+        # in from outside the panel -- reviewer reading order, not alphabetical.
+        _scope_order = {"PANEL_REPORTABLE": 0, "PANEL_VUS": 1, "OFF_PANEL": 2}
+        _prio["_o"] = _prio["Scope"].map(_scope_order).fillna(9)
+        _prio.sort_values(["_o", "Exo_Rank", "Gene"], kind="stable") \
+             .drop(columns=["_o"]) \
+             .to_excel(xw, index=False, sheet_name="Prioritised")
 
 print(f"Wrote Excel report → {args.xlsx_out}")

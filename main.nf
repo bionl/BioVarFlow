@@ -16,6 +16,9 @@ include { POST_SAREK } \
 include { CONSENSUS_CALLING } \
   from './modules/consensus.nf'
 
+include { EXOMISER } \
+  from './modules/exomiser.nf'
+
 include { DB_QC_EXPORT } \
   from './modules/db_qc_export.nf'
 
@@ -332,7 +335,7 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
             }
 
         // Run post-processing
-        POST_SAREK(vcf_ch, bam_ch, bed_ch)
+        POST_SAREK(Channel.empty(), Channel.empty(), vcf_ch, bam_ch, bed_ch)
 }
 
 workflow RUN_FROM_POST_SAMPLESHEET {
@@ -386,7 +389,7 @@ workflow RUN_FROM_POST_SAMPLESHEET {
         bam_ch.view { s, a, i -> "🧬 BAM -> ${s} :: ${a.name}" }
 
         // Run post-processing (no consensus for post-samplesheet)
-        POST_SAREK(vcf_ch, bam_ch, bed_ch)
+        POST_SAREK(Channel.empty(), Channel.empty(), vcf_ch, bam_ch, bed_ch)
 }
 
 workflow RUN_FULL_VARIANT_CALLING {
@@ -394,6 +397,10 @@ workflow RUN_FULL_VARIANT_CALLING {
         bed_ch
 
     main:
+        // Only the consensus branch produces one; declared up front so the
+        // other branches leave a defined value.
+        raw_consensus_ch = null
+
         if (params.somatic_mode) {
             log.info """
         ╔════════════════════════════════════════════════════════════╗
@@ -477,6 +484,10 @@ workflow RUN_FULL_VARIANT_CALLING {
             )
 
             final_vcf_ch = CONSENSUS_CALLING.out.consensus_vcf
+            // Exomiser ranks genome-wide, so it takes the UNFILTERED consensus.
+            // Everything downstream is panel-restricted and would hide exactly
+            // the off-panel findings Exomiser is run to surface.
+            raw_consensus_ch = CONSENSUS_CALLING.out.consensus_vcf_raw
         } else {
             final_vcf_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.dv_vcf
         }
@@ -535,9 +546,35 @@ workflow RUN_FULL_VARIANT_CALLING {
             log.warn "params.run_db_qc=false → skipping run_output_manifest.tsv (QC Gate JSON is required to populate qc_status / qc_recommendation)."
         }
 
+        // Exomiser runs BEFORE POST_SAREK so its per-sample TSVs can become the
+        // 'Exomiser' and 'Prioritised' tabs. EXOMISER_BATCH carries
+        // errorStrategy 'ignore' and POST_SAREK substitutes a NO_FILE
+        // placeholder, so a failed or skipped Exomiser costs those two tabs and
+        // nothing else.
+        exomiser_tsv_ch = Channel.empty()
+        if (params.run_exomiser && raw_consensus_ch != null && params.phenotypes) {
+            EXOMISER(
+                raw_consensus_ch.map { sample, vcf, tbi ->
+                    tuple([ sample: sample, assay: assayMap.get(sample, 'NA') ], vcf, tbi)
+                }
+            )
+            exomiser_tsv_ch = EXOMISER.out.reports
+                .flatten()
+                .filter { f -> f.name.endsWith('_exomiser.variants.tsv') }
+                .map    { f -> tuple(f.name.replaceFirst(/_exomiser\.variants\.tsv$/, ''), f) }
+        } else if (params.run_exomiser) {
+            log.warn "Exomiser skipped: needs --create_consensus and --phenotypes."
+        }
+
+        // Strand bias tests off-panel variants too and needs the unfiltered
+        // consensus for their REF/ALT and AD. Keyed by meta to match vcf_ch.
+        raw_cons_keyed_ch = raw_consensus_ch == null ? Channel.empty()
+            : raw_consensus_ch.map { sample, vcf, tbi ->
+                  tuple([ sample: sample, assay: assayMap.get(sample, 'NA') ], vcf, tbi) }
+
         // POST_SAREK (VEP annotation) is germline-only — skip in somatic mode
         if (!params.somatic_mode) {
-            POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
+            POST_SAREK(exomiser_tsv_ch, raw_cons_keyed_ch, vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
         }
 }
 

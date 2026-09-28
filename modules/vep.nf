@@ -10,6 +10,8 @@ params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/templ
 params.run_vep     = params.run_vep     ?: true
 params.min_dp   = params.min_dp   ?: 10
 params.min_qual = params.min_qual ?: 10
+// Rows kept on the Exomiser tab, by rank. 0 = keep everything Exomiser emitted.
+params.exomiser_top = params.exomiser_top ?: 0
 
 // Reference used by NormalizeVCF for left-alignment/trimming: see the lazy
 // fallback inside POST_SAREK. Deliberately NOT resolved here at module script
@@ -355,21 +357,61 @@ process SexCheck {
 process StrandBiasPileup {
   tag { "${meta.sample} (${meta.assay})" }
   input:
-    tuple val(meta), path(vcf), path(bam), path(bai)
+    // raw_bam is the full markduplicates BAM, NOT the BED-filtered one. The
+    // panel BAM cannot answer anything about off-panel variants -- those reads
+    // were removed by `samtools view -L` -- and that left every EXOMISER_ONLY
+    // row with a blank StrandBias, which reads as "clean" to a reviewer.
+    // At a panel position the two BAMs give identical counts anyway: a read
+    // overlapping a panel base overlaps the BED by definition, so it survives
+    // the filter. Using the raw BAM for both therefore costs nothing in
+    // accuracy and removes the blind spot.
+    // No BAM index. main.nf builds the .bai path by string concatenation and
+    // never verifies it on GCS (checkIfExists: false), so it can point at a
+    // file that does not exist -- which is what it did. Nothing consumed it
+    // before: BedFilterBAM takes only the BAM and runs its own samtools index.
+    // Streaming with --targets-file sidesteps the question; the bcftools
+    // container has no samtools, so this process cannot build one either.
+    tuple val(meta), path(vep_vcf), path(cons_vcf), path(cons_tbi),
+          path(exomiser_tsv), path(raw_bam)
     path fasta
     path fai
   output:
-    tuple val(meta), path("${meta.sample}_mpileup_adf_adr.tsv")
+    tuple val(meta), path("${meta.sample}_mpileup_adf_adr.tsv"),
+                     path("${meta.sample}_sb_sites.vcf.gz")
   script:
     def sample = meta.sample
   """
   set -euo pipefail
-  # No index needed: VEP emits a plain uncompressed VCF, `query` streams it, and
-  # --targets-file (unlike --regions-file) reads sequentially rather than seeking.
+
+  # Sites to test = panel variants (the VEP VCF) + everything Exomiser ranked.
+  # Exomiser writes CONTIG without the 'chr' prefix, so add it back.
+  bcftools query -f '%CHROM\\t%POS\\n' $vep_vcf > sites_raw.txt
+  if [ -s "$exomiser_tsv" ]; then
+    awk -F'\\t' 'NR>1 && \$15 != "" {
+        c = \$15; if (c !~ /^chr/) c = "chr" c; print c "\\t" \$16
+      }' $exomiser_tsv >> sites_raw.txt
+  fi
+  sort -u sites_raw.txt > sites.txt
+
+  # Subset the consensus VCF to those positions with awk rather than
+  # `bcftools view -R/-T`: both expect the positions file in the VCF's own
+  # contig order, and ours is a lexicographic sort -u (chr10 before chr2). A
+  # hash join sidesteps the ordering question entirely, and the output keeps
+  # the consensus VCF's order -- which is what the regions file below needs.
   #
-  # uniq is required, not tidiness: a --targets-file must hold each position
-  # once, and a normalized VCF repeats POS for every ALT of a multiallelic site.
-  bcftools query -f '%CHROM\\t%POS\\n' $vcf | uniq > sites.txt
+  # The consensus VCF is used, not the VEP VCF, because only it contains the
+  # off-panel records, with the REF/ALT and FORMAT/AD that strand_bias.py needs
+  # for allele matching and the indel VAF-reconciliation gate.
+  bcftools view $cons_vcf \\
+  | awk -F'\\t' 'NR==FNR { keep[\$1"\\t"\$2]; next }
+                 /^#/ { print; next }
+                 (\$1"\\t"\$2) in keep' sites.txt - \\
+  | bgzip -c > ${sample}_sb_sites.vcf.gz
+
+  # Targets for mpileup, derived from the subset VCF so they are already in
+  # reference order. --targets-file streams the BAM rather than seeking, which
+  # is slower on a whole-exome BAM than -R would be but needs no index.
+  bcftools query -f '%CHROM\\t%POS\\n' ${sample}_sb_sites.vcf.gz | uniq > regions.txt
 
   # Deliberately NOT `bcftools call -C alleles`. Constraining the pileup to the
   # caller's alleles looks like the right way to fix indel counting, and it does
@@ -379,11 +421,11 @@ process StrandBiasPileup {
   # IQMM it returned ALT='.' for MSH2, RUNX1 and DSG2 alike and flagged nothing.
   # Plain mpileup reports what it sees and lets the Fisher test decide.
   bcftools mpileup \\
-    --targets-file sites.txt \\
+    --targets-file regions.txt \\
     --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \\
     --fasta-ref $fasta \\
     --min-BQ 13 --min-MQ 0 --no-BAQ --max-depth 8000 \\
-    -Ou $bam \\
+    -Ou $raw_bam \\
   | bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT[\\t%ADF\\t%ADR]\\n' \\
   > ${sample}_mpileup_adf_adr.tsv
   """
@@ -399,7 +441,9 @@ process StrandBiasTest {
     tuple val(meta), path(pileup), path(vcf)
     each path(script)
   output:
-    tuple val(meta), path("${meta.sample}_strand_bias.tsv")
+    // The sites VCF rides along: it is the only source of FORMAT/AD for
+    // off-panel variants, and LeanReport needs it to give them a VAF.
+    tuple val(meta), path("${meta.sample}_strand_bias.tsv"), path(vcf)
   script:
     def sample = meta.sample
   """
@@ -480,8 +524,11 @@ process LeanReport {
           path(sex_check),
           path(gaps20), path(gaps30),
           path(thresholds),
-          path(strand_bias)
+          path(strand_bias), path(sites_vcf),
+          path(exomiser_tsv)
     each path(script)
+    each path(mane_map)
+    each path(panel_genes)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants.xlsx")
   script:
@@ -496,7 +543,12 @@ process LeanReport {
     --acmg-thresholds ${thresholds} \
     --sexcheck ${sex_check} \
     --gaps20 ${gaps20} --gaps30 ${gaps30} \
-    --strand-bias ${strand_bias}
+    --strand-bias ${strand_bias} \
+    --sites-vcf ${sites_vcf} \
+    --mane ${mane_map} \
+    --panel-genes ${panel_genes} \
+    --exomiser ${exomiser_tsv} \
+    --exomiser-top ${params.exomiser_top}
   """
 }
 
@@ -527,6 +579,8 @@ process GENERATE_ACMG_REPORT {
 
 workflow POST_SAREK {
   take:
+    exomiser_ch // (sample, <sample>_exomiser.variants.tsv) -- may be empty
+    raw_cons_ch // (meta, consensus vcf, tbi) -- unfiltered; may be empty
     vcf_ch   // (sample, vcf)
     bam_ch//  // // (samp//le, bam, bai)
     bed_ch   // value channel with //BED
@@ -605,10 +659,26 @@ workflow POST_SAREK {
     // Per-variant strand bias, recomputed from the raw alignment (see the
     // StrandBiasPileup header for why the caller's own FS is not enough).
     strand_bias_script_ch = Channel.fromPath("${params.scriptdir}/strand_bias.py").first()
-    StrandBiasPileup(
-      vep_ch.join(bam_sample_ch).map { s, vcf, bam, bai -> tuple(s, vcf, bam, bai) },
-      norm_fasta_ch, norm_fai_ch)
-    StrandBiasTest(StrandBiasPileup.out.join(vep_ch), strand_bias_script_ch)
+    // Key every channel on the SAMPLE NAME before joining. vep_ch, raw_cons_ch
+    // and bam_ch are keyed by the meta map, but exomiser_ch is keyed by a plain
+    // sample string (main.nf derives it from the TSV filename). Joining those
+    // directly matches nothing, silently sending every sample down the NO_FILE
+    // branch.
+    no_file_sb = file("${workflow.projectDir}/assets/NO_FILE", checkIfExists: true)
+    sb_input_ch = vep_ch
+      .map { meta, vcf -> tuple(meta.sample, meta, vcf) }
+      .join(raw_cons_ch.map { meta, v, t -> tuple(meta.sample, v, t) }, remainder: true)
+      .join(exomiser_ch,                                                remainder: true)
+      .join(bam_ch.map { meta, b, i -> tuple(meta.sample, b) },         remainder: true)
+      // remainder:true also emits right-only rows (a sample present in one
+      // channel but not vep_ch); drop those, and any sample missing the VCF,
+      // consensus or BAM the pileup actually needs.
+      .filter { it[1] != null && it[2] != null && it[3] != null && it[6] != null }
+      .map { sample, meta, vep, cons, tbi, exo, bam ->
+             tuple(meta, vep, cons, tbi, exo ?: no_file_sb, bam) }
+
+    StrandBiasPileup(sb_input_ch, norm_fasta_ch, norm_fai_ch)
+    StrandBiasTest(StrandBiasPileup.out, strand_bias_script_ch)
 
     // prepare joins keyed by sample
     exon_cov_ch         = CoverageSummary.out.map { s, summary, per_base -> tuple(s, summary) }
@@ -630,6 +700,26 @@ workflow POST_SAREK {
       .join(gaps30_ch)
       .join(thresholds_ch)
       .join(StrandBiasTest.out)
-    LeanReport(lean_input_ch, script_ch)
+    // Exomiser runs as ONE batch for the whole run, so its per-sample TSVs are
+    // joined back here by sample name. remainder:true plus the NO_FILE stand-in
+    // keeps LeanReport running for samples Exomiser skipped, and -- with
+    // errorStrategy 'ignore' on EXOMISER_BATCH -- keeps a failed Exomiser from
+    // costing the reports entirely. The workbook simply omits the two tabs.
+    // Defined here because both LeanReport (off-panel transcripts on the
+    // Prioritised sheet) and MergeVariantsTable consume it.
+    // Splits the Prioritised tab into PANEL_VUS / OFF_PANEL. Deliberately NOT
+    // --sf-genes: that would also gate the ACMG, coverage-gap and thresholds
+    // sheets, which are currently scoped by the capture BED alone.
+    panel_genes_ch = Channel.fromPath("${workflow.projectDir}/data/acmg_sf_gene_list.txt",
+                                      checkIfExists: true).first()
+    mane_map_ch = Channel.fromPath("${workflow.projectDir}/data/mane_enst_to_refseq.tsv",
+                                   checkIfExists: true).first()
+    no_exomiser = file("${workflow.projectDir}/assets/NO_FILE")
+    lean_with_exo_ch = lean_input_ch
+      .map { tup -> tuple(tup[0].sample, tup) }
+      .join(exomiser_ch, remainder: true)
+      .filter { s, tup, exo -> tup != null }
+      .map    { s, tup, exo -> tup + [ exo ?: no_exomiser ] }
+    LeanReport(lean_with_exo_ch, script_ch, mane_map_ch, panel_genes_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 }
