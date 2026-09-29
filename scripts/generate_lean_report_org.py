@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, re, argparse
+import sys, os, re, argparse, collections, gzip
 import pandas as pd
 from cyvcf2 import VCF
 from urllib.parse import quote_plus, unquote
