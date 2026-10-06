@@ -30,6 +30,15 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--germline-source", default=None,
+               help="Which BAM produced the germline/ACMG calls in this report. "
+                    "'normal:<name>' for a tumor/normal pair, 'tumor (tumor-only)' "
+                    "when HaplotypeCaller ran on the tumor BAM via the injected "
+                    "_germline samplesheet row. The two are NOT equivalent: a "
+                    "tumor BAM violates the diploid assumption behind genotype "
+                    "calling, so LOH reads as hom and subclonal somatic variants "
+                    "read as germline het. Recorded in Sample Summary and used to "
+                    "gate the zygosity QC flags.")
 p.add_argument("--somatic-vcf", default=None,
                help="VEP-annotated, panel-restricted somatic VCF containing ALL "
                     "in-panel calls (FILTER preserved). PASS and the tumor-only "
@@ -964,6 +973,87 @@ for var in vcf:
 
 df = pd.DataFrame(records)
 
+# ---------------------------------------------------------------------------
+# Multiallelic site reconciliation
+# ---------------------------------------------------------------------------
+# `bcftools norm -m -any` splits a multiallelic site into one biallelic record
+# per ALT. That is required for annotation, but it loses site-level context in
+# ways that misrepresent the variant:
+#
+#   * GT becomes 1/0 and 0/1 (a biallelic record cannot express 1/2), so
+#     Zygosity reads "het" for a site carrying no reference allele at all.
+#   * FORMAT/AD is subset to [ref, this_alt], so the OTHER alt's reads vanish
+#     from the VAF denominator. A site with AD 0,24,17 and DP 41 reported
+#     VAF 1.000 for BOTH alleles instead of 0.585 / 0.415.
+#
+# This is why `bcftools +fill-tags -t FORMAT/VAF` was removed from POST_SAREK:
+# it ran after the split and could only ever see alt/(ref+alt). Rebuild the
+# site by grouping the split records back together on coordinates -- AD_Ref is
+# the site's reference depth repeated on each row, so summing the ALTs recovers
+# the site total -- then recompute VAF and restate the genotype.
+if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
+    _key = ["Chrom", "Pos"]
+    _ar = pd.to_numeric(df["AD_Ref"], errors="coerce")
+    _aa = pd.to_numeric(df["AD_Alt"], errors="coerce")
+
+    _n_alt   = df.groupby(_key)["AD_Alt"].transform("size")
+    _alt_sum = _aa.groupby([df[c] for c in _key]).transform("sum")
+    _site_ad = _ar + _alt_sum
+
+    df["Multiallelic"]  = (_n_alt > 1).map({True: "Y", False: "N"})
+    df["Site_AD_Total"] = _site_ad.astype("Int64")
+
+    # VAF against site-level informative depth. Single-ALT rows are unchanged
+    # (ref + alt is already the site total).
+    df["VAF"] = (_aa / _site_ad).where(_site_ad > 0).round(4)
+
+    # Restate the genotype for split rows. A 1/2 site is heterozygous for two
+    # different ALT alleles; "het" alone hides that there is no ref allele.
+    _multi = _n_alt > 1
+    df["GT_site"] = df["GT"]
+    df.loc[_multi, "GT_site"]  = "1/2"
+    df.loc[_multi, "Zygosity"] = "het (1/2)"
+
+    # AD counts allele-assigned reads; DP counts all reads at the locus, so a
+    # gap between them is normal (uninformative/filtered reads). Surface it
+    # rather than silently absorbing it into whichever denominator we chose.
+    _dp = pd.to_numeric(df["DP"], errors="coerce")
+    df["AD_Sum_vs_DP"] = (_site_ad - _dp).astype("Int64")
+
+    # ---- Zygosity sanity vs VAF ----------------------------------------
+    # Germline genotype calling assumes a clean diploid genome: hom ~1.0,
+    # het ~0.5. A TUMOR BAM breaks that assumption, and when HaplotypeCaller
+    # runs on one (the tumor-only path, via the injected _germline row) the
+    # genotype can be confidently wrong in two directions:
+    #
+    #   LOH            deletes one allele, so a true germline HET is called
+    #                  1/1 and reported "hom". For a recessive condition that
+    #                  is the difference between carrier and affected.
+    #   Somatic bleed  a subclonal somatic variant gets GT 0/1 and lands in the
+    #                  ACMG sheet as a germline finding. Germline results drive
+    #                  family cascade testing, so this is the costly one.
+    #
+    # Neither is a caller-disagreement problem -- a second caller trained on
+    # diploid data agrees. VAF is the only available discriminator, which is
+    # why it has to be the site-aware value computed above.
+    #
+    # Advisory only: flagged, never dropped. Flags are raised solely when the
+    # calls came from a tumor BAM; on a normal BAM these ratios have ordinary
+    # benign explanations and the noise would bury the real signal.
+    df["Zygosity_QC"] = ""
+    _src = str(args.germline_source or "")
+    if _src.startswith("tumor"):
+        _zyg = df["Zygosity"].astype(str)
+        _vaf = pd.to_numeric(df["VAF"], errors="coerce")
+        _flag = pd.Series("", index=df.index)
+        # A hom call keeping real reference support is not hom-by-descent.
+        _flag = _flag.mask(_zyg.eq("hom") & _vaf.notna() & (_vaf < 0.90),
+                           "HOM_VAF_DISCORDANT")
+        # A het well under the diploid expectation may not be germline at all.
+        _flag = _flag.mask(_zyg.str.startswith("het") & _vaf.notna() & (_vaf < 0.30),
+                           "LOW_VAF_POSSIBLE_SOMATIC")
+        df["Zygosity_QC"] = _flag
+
 # -------------------------
 # Build tabs
 # -------------------------
@@ -973,7 +1063,13 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     ss = {
         "Sample_ID": sample_id,
         "Assay": args.assay,
-        "Build": args.build
+        "Build": args.build,
+        # Which BAM the germline/ACMG half of this report came from. For a
+        # paired case it is the NORMAL, published under the tumor's name, so
+        # every BAM-derived QC number below describes the normal library --
+        # not the tumor. Stated explicitly because the workbook otherwise
+        # mixes QC from two different BAMs with nothing saying so.
+        "Germline_Source": args.germline_source or "germline (single sample)"
     }
     ss.update(parse_flagstat(args.flagstat))
     ss.update(parse_samtools_stats(args.stats))
@@ -1021,8 +1117,11 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     if sf_genes:
         acmg = acmg[acmg["Gene"].isin(sf_genes)]
     acmg_cols = [
-        "Gene","Variant","HGVSc","HGVSp","MANE_ID","Zygosity","GT","AD_Ref","AD_Alt","DP","GQ","QUAL",
-        "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full"
+        "Gene","Variant","HGVSc","HGVSp","MANE_ID","Zygosity","GT","AD_Ref","AD_Alt","DP","VAF","GQ","QUAL",
+        "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
+        # Site-level reconciliation of split multiallelics -- VAF above is
+        # computed against Site_AD_Total, not AD_Ref+AD_Alt.
+        "Multiallelic","Site_AD_Total","Zygosity_QC"
     ]
     acmg[acmg_cols].to_excel(xw, index=False, sheet_name="ACMG SF (P-LP)")
 
@@ -1072,7 +1171,8 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     # 5) PASS variant table (germline HC)
     pass_cols = [
         "Variant","Gene","HGVSc","HGVSp","MANE_ID","Transcript","Consequence","GT","Zygosity","AD_Ref","AD_Alt","DP","GQ","QUAL",
-        "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full"
+        "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
+        "Multiallelic","Site_AD_Total","Zygosity_QC"
     ]
     df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
 

@@ -689,7 +689,14 @@ workflow RUN_FULL_VARIANT_CALLING {
                 .filter { vcf -> vcf.parent.name.endsWith('_germline') }
                 .map { vcf ->
                     def origSample = vcf.parent.name.replaceAll(/_germline$/, '')
-                    def meta = [ sample: origSample, assay: assayMap.get(origSample, 'NA') ]
+                    // germline_source records WHICH BAM produced these calls. For
+                    // tumor-only it is the tumor itself (injected _germline row), so
+                    // the genotypes carry LOH and subclonal somatic signal; the
+                    // report flags zygosity accordingly. Must be set identically on
+                    // the matching BAM channel -- POST_SAREK joins on the meta MAP,
+                    // so an asymmetric key silently matches nothing.
+                    def meta = [ sample: origSample, assay: assayMap.get(origSample, 'NA'),
+                                 germline_source: 'tumor (tumor-only)' ]
                     tuple(meta, vcf)
                 }
 
@@ -701,7 +708,8 @@ workflow RUN_FULL_VARIANT_CALLING {
                 }
                 .map { vcf ->
                     def tumorSample = normalToTumorMap[vcf.parent.name]
-                    def meta = [ sample: tumorSample, assay: assayMap.get(tumorSample, 'NA') ]
+                    def meta = [ sample: tumorSample, assay: assayMap.get(tumorSample, 'NA'),
+                                 germline_source: "normal:${vcf.parent.name}" ]
                     tuple(meta, vcf)
                 }
 
@@ -715,7 +723,8 @@ workflow RUN_FULL_VARIANT_CALLING {
                 .filter { sample, bam, bai -> sample.endsWith('_germline') }
                 .map { sample, bam, bai ->
                     def origSample = sample.replaceAll(/_germline$/, '')
-                    def meta = [ sample: origSample, assay: assayMap.get(origSample, 'NA') ]
+                    def meta = [ sample: origSample, assay: assayMap.get(origSample, 'NA'),
+                                 germline_source: 'tumor (tumor-only)' ]
                     tuple(meta, bam, bai)
                 }
 
@@ -726,7 +735,8 @@ workflow RUN_FULL_VARIANT_CALLING {
                 }
                 .map { sample, bam, bai ->
                     def tumorSample = normalToTumorMap[sample]
-                    def meta = [ sample: tumorSample, assay: assayMap.get(tumorSample, 'NA') ]
+                    def meta = [ sample: tumorSample, assay: assayMap.get(tumorSample, 'NA'),
+                                 germline_source: "normal:${sample}" ]
                     tuple(meta, bam, bai)
                 }
 

@@ -16,6 +16,30 @@ params.min_qual = params.min_qual ?: 10
 // VEP resource params expected from main/config:
 // params.vep_fasta, params.revel_vcf, params.alpha_missense_vcf, params.clinvar_vcf
 
+// Reference for `bcftools norm -f` on BOTH the germline and somatic paths.
+//
+// Resolved lazily, not at module load: params.fasta is set by
+// external/sarek/main.nf when it is included, and the igenomes map is the
+// reliable fallback since config-parse time always populates it.
+//
+// Deliberately NOT params.ref_fasta -- main.nf defaults that to params.vep_fasta,
+// which is the Ensembl VEP reference whose contigs are named 1/2/.../MT. Passing
+// it here fails on every record, since the BAMs are chr-prefixed GATK.
+def resolveNormFasta() {
+    def f = params.norm_fasta ?: params.fasta
+    if (!f && params.genomes && params.genome && params.genomes.containsKey(params.genome)) {
+        f = params.genomes[params.genome].fasta
+    }
+    if (!f) {
+        error "❌ No reference for bcftools norm.\n" +
+              "   Tried --norm_fasta, params.fasta, params.genomes[${params.genome}].fasta.\n" +
+              "   genome=${params.genome}  genomes_loaded=${params.genomes ? params.genomes.size() : 0}\n" +
+              "   Set --norm_fasta to the GATK assembly the BAMs were aligned against.\n" +
+              "   Do NOT point this at the Ensembl VEP fasta -- its contigs are 1/2/.../MT."
+    }
+    return f
+}
+
 
 /********************  PROCESSES (unchanged logic, publish to per-sample dirs)  ********************/
 
@@ -39,12 +63,26 @@ process NormalizeVCF {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
   input:
     tuple val(meta), path(vcf)
+    path fasta
+    path fai
   output:
     tuple val(meta), path("${meta.sample}.normalized.vcf.gz")
   script:
     def sample = meta.sample
   """
-  bcftools norm -m -any $vcf -Oz -o ${sample}.normalized.vcf.gz
+  # -m -any  splits multiallelic sites into one record per ALT allele.
+  # -f       left-aligns indels and trims shared flanking bases. Without it,
+  #          alleles stay non-parsimonious (e.g. TAA>GAA instead of T>G), which
+  #          breaks position-keyed annotation lookups -- SpliceAI silently
+  #          returns nothing for the affected records, and ClinVar misses indels.
+  #
+  # The reference MUST be the one the BAMs were aligned to (chr-prefixed GATK
+  # assembly), never the Ensembl VEP fasta -- see resolveNormFasta().
+  #
+  # No -c override: bcftools exits on a REF mismatch by default, which is what
+  # we want -- a mismatch means the wrong reference, and continuing would
+  # silently corrupt allele representations.
+  bcftools norm -m -any -f $fasta $vcf -Oz -o ${sample}.normalized.vcf.gz
   tabix -p vcf ${sample}.normalized.vcf.gz
   """
 }
@@ -63,19 +101,6 @@ process FilterVCF {
   """
 }
 
-process AddVAF {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  input:
-    tuple val(meta), path(vcf)
-  output:
-    tuple val(meta), path("${meta.sample}.vaf_added.vcf.gz")
-  script:
-    def sample = meta.sample
-  """
-  bcftools +fill-tags $vcf -Oz -o ${sample}.vaf_added.vcf.gz -- -t FORMAT/VAF
-  tabix -p vcf ${sample}.vaf_added.vcf.gz
-  """
-}
 
 process BedFilterBAM {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
@@ -398,6 +423,9 @@ process LeanReport {
   script:
     def sample  = meta.sample
     def som_arg = somatic_vcf.name != 'NO_FILE' ? "--somatic-vcf ${somatic_vcf}" : ""
+    // Which BAM produced the germline/ACMG calls. Set per-sample in main.nf for
+    // somatic runs; a plain germline run has one sample and no ambiguity.
+    def gsrc    = meta.germline_source ?: 'germline (single sample)'
   """
   mkdir -p ${sample}_report
   python ${script} \
@@ -408,6 +436,7 @@ process LeanReport {
     --acmg-thresholds ${thresholds} \
     --sexcheck ${sex_check} \
     --gaps20 ${gaps20} --gaps30 ${gaps30} \
+    --germline-source '${gsrc}' \
     ${som_arg}
   """
 }
@@ -436,6 +465,8 @@ process NormalizeSomatic {
   tag { "${meta.sample}" }
   input:
     tuple val(meta), path(vcf)
+    path fasta
+    path fai
   output:
     tuple val(meta), path("${meta.sample}.somatic.norm.vcf.gz")
   script:
@@ -446,24 +477,15 @@ process NormalizeSomatic {
     // filtering in one place (Python) also lets the QC tab explain *why* a
     // variant was excluded instead of it silently disappearing upstream.
   """
-  bcftools norm -m -any $vcf -Oz -o ${sample}.somatic.norm.vcf.gz
+  # -f left-aligns indels against the alignment reference. Mutect2 emits a high
+  # proportion of indels and this is the path where indel representation drives
+  # interpretation -- a non-parsimonious indel matches neither ClinVar nor a
+  # position-keyed hotspot list. See NormalizeVCF for the full rationale.
+  bcftools norm -m -any -f $fasta $vcf -Oz -o ${sample}.somatic.norm.vcf.gz
   tabix -p vcf ${sample}.somatic.norm.vcf.gz
   """
 }
 
-process AddVAFSomatic {
-  tag { "${meta.sample}" }
-  input:
-    tuple val(meta), path(vcf)
-  output:
-    tuple val(meta), path("${meta.sample}.somatic.vaf.vcf.gz")
-  script:
-    def sample = meta.sample
-  """
-  bcftools +fill-tags $vcf -Oz -o ${sample}.somatic.vaf.vcf.gz -- -t FORMAT/VAF
-  tabix -p vcf ${sample}.somatic.vaf.vcf.gz
-  """
-}
 
 process VEP_Annotate_Somatic {
   tag { "${meta.sample}" }
@@ -549,11 +571,23 @@ workflow POST_SAREK {
     template_dir_ch = Channel.fromPath("${params.template_dir}", type: 'dir').first()
     // VCF path
     BedFilterVCF(sample_inputs.map { s, vcf, bam, bai -> tuple(s, vcf) }, bed_ch)
-    NormalizeVCF(BedFilterVCF.out)
+    def _normFasta = resolveNormFasta()
+    norm_fasta_ch = Channel.value(file(_normFasta))
+    norm_fai_ch   = Channel.value(file("${_normFasta}.fai"))
+
+    NormalizeVCF(BedFilterVCF.out, norm_fasta_ch, norm_fai_ch)
     FilterVCF(NormalizeVCF.out)
-    AddVAF(FilterVCF.out)
+    // No FORMAT/VAF tag is written. `bcftools +fill-tags` used to run here, but
+    // NormalizeVCF already split multiallelics, so fill-tags only ever saw
+    // biallelic records with AD=[site_ref, this_alt] and computed
+    // alt/(ref+alt). At a 1/2 site the sibling allele's reads are not in the
+    // record, so there is no denominator to compute against. Reordering cannot
+    // fix it: the split has to happen before VEP.
+    //
+    // The report recomputes VAF from AD against site-level depth
+    // (AD_ref + sum of every ALT's AD) and overwrites every row.
     vep_ch = params.run_vep ? VEP_Annotate(
-      AddVAF.out, 
+      FilterVCF.out, 
       file(params.vep_cache), 
       file(params.vep_fasta), 
       file(params.vep_fasta + ".fai"), 
@@ -570,7 +604,7 @@ workflow POST_SAREK {
       file(params.bayesdel_vcf), 
       file(params.bayesdel_vcf + ".tbi"),
       file(params.vep_plugins)
-      ) : AddVAF.out  // (sample, vcf)
+      ) : FilterVCF.out  // (sample, vcf)
 
     // BAM path
     BedFilterBAM(sample_inputs.map { s, vcf, bam, bai -> tuple(s, vcf, bam) }, bed_ch)
@@ -629,11 +663,19 @@ workflow POST_SAREK_SOMATIC {
     // Annotate the FULL in-panel set once. PASS and the tumor-only thresholds
     // are applied downstream in the report script, so VEP runs a single time
     // per sample regardless of how many views of the data the report needs.
-    NormalizeSomatic(BedFilterSomatic.out)
-    AddVAFSomatic(NormalizeSomatic.out)
+    def _somNormFasta = resolveNormFasta()
+    som_fasta_ch = Channel.value(file(_somNormFasta))
+    som_fai_ch   = Channel.value(file("${_somNormFasta}.fai"))
 
+    NormalizeSomatic(BedFilterSomatic.out, som_fasta_ch, som_fai_ch)
+    // No FORMAT/VAF tag. `bcftools +fill-tags` used to run here and nothing read
+    // its output: the report uses Mutect2's own FORMAT/AF, a model posterior
+    // that accounts for read orientation and filtered depth. The AD ratio
+    // fill-tags computes reads 1.000 whenever there are zero ref reads -- on as
+    // few as 6 reads -- where AF reports 0.833. AF is also multiallelic-aware,
+    // which the post-split tag was not.
     somatic_vep_ch = params.run_vep ? VEP_Annotate_Somatic(
-      AddVAFSomatic.out,
+      NormalizeSomatic.out,
       file(params.vep_cache),
       file(params.vep_fasta),
       file(params.vep_fasta + ".fai"),
@@ -650,7 +692,7 @@ workflow POST_SAREK_SOMATIC {
       file(params.bayesdel_vcf),
       file(params.bayesdel_vcf + ".tbi"),
       file(params.vep_plugins)
-    ) : AddVAFSomatic.out
+    ) : NormalizeSomatic.out
 
   emit:
     // tuple(meta, <sample>.somatic.vep.vcf) — every in-panel call, annotated,
