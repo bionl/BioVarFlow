@@ -627,8 +627,9 @@ workflow POST_SAREK {
     mosdepth_summary_ch = MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, summary) }
     thresholds_ch       = MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, thresholds) }
 
-    // join all for LeanReport (somatic_vcf_ch is optional — left-join with remainder)
-    lean_input_ch = vep_ch
+    // join all for LeanReport. Every channel above is keyed by the SAME meta map
+    // (they all descend from sample_inputs), so joining on meta is safe here.
+    qc_joined_ch = vep_ch
       .join(exon_cov_ch)
       .join(R1R2Ratio.out)
       .join(ForwardReverseRatio.out)
@@ -639,10 +640,28 @@ workflow POST_SAREK {
       .join(gaps20_ch)
       .join(gaps30_ch)
       .join(thresholds_ch)
-      .join(somatic_vcf_ch, remainder: true)
-      .map { meta, vcf, exon_cov, r1r2, frstrand, flagstat, stats, mosdepth_summary, sex_check, gaps20, gaps30, thresholds, somatic_vcf ->
-          def som = (somatic_vcf != null) ? somatic_vcf : file("${projectDir}/assets/NO_FILE")
-          tuple(meta, vcf, exon_cov, r1r2, frstrand, flagstat, stats, mosdepth_summary, sex_check, gaps20, gaps30, thresholds, som)
+
+    // somatic_vcf_ch is OPTIONAL and comes from a different subworkflow, so its
+    // meta is built independently -- it carries no germline_source, while the
+    // chain above does. Joining those two on the meta MAP matched nothing and
+    // `remainder: true` then emitted the unmatched somatic entry as a 3-element
+    // tuple [meta, null, vcf] into a closure expecting 13, which is a
+    // MissingMethodException at runtime, not a parse error.
+    //
+    // Key this join on the sample NAME instead. It is the one field both sides
+    // agree on by construction, and it stays correct if either meta gains a
+    // field later.
+    som_keyed_ch = somatic_vcf_ch.map { meta, somatic_vcf -> tuple(meta.sample, somatic_vcf) }
+
+    lean_input_ch = qc_joined_ch
+      .map { items -> tuple(items[0].sample, items) }
+      .join(som_keyed_ch, remainder: true)
+      // A somatic VCF with no matching QC chain would arrive with items == null.
+      // That should be impossible (both derive from the same sample set) but
+      // dropping it is cheaper than a confusing failure 15 hours in.
+      .filter { sample, items, somatic_vcf -> items != null }
+      .map { sample, items, somatic_vcf ->
+          items + [ somatic_vcf != null ? somatic_vcf : file("${projectDir}/assets/NO_FILE") ]
       }
     LeanReport(lean_input_ch, script_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
