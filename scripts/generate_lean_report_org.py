@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, re, argparse
+import sys, os, re, argparse, gzip
 import pandas as pd
 from cyvcf2 import VCF
 from urllib.parse import quote_plus
@@ -638,6 +638,75 @@ def somatic_is_tumor_only(vcf_path):
         return False
 
 
+def load_somatic_sites(path):
+    """{(chrom, pos, ref, alt): FILTER} from the somatic VEP VCF.
+
+    Used to flag germline/ACMG rows that Mutect2 ALSO called. Both callers now
+    run `bcftools norm -m -any -f`, so allele representations are comparable --
+    before left-alignment this join would have silently missed indels.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {}
+    out = {}
+    try:
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                f = line.split("\t", 8)
+                if len(f) < 7:
+                    continue
+                out[(f[0], f[1], f[3].upper(), f[4].upper())] = f[6]
+    except OSError:
+        return {}
+    return out
+
+
+def somatic_zygosity(gt):
+    """Literal zygosity from Mutect2's GT. Near-constant 'het' in practice --
+    Mutect2 does not genotype a tumor, it reports support for an ALT allele."""
+    if not gt:
+        return None
+    alleles = [a for a in str(gt).replace("|", "/").split("/") if a not in ("", ".")]
+    if not alleles:
+        return None
+    if all(a == "0" for a in alleles):
+        return "ref"
+    if all(a != "0" for a in alleles):
+        return "hom"
+    return "het"
+
+
+def somatic_clonality(af):
+    """Band the tumor allele fraction. This is the informative axis for a
+    somatic call, and it is also how germline leakage shows itself.
+
+    A true somatic variant sits wherever its subclone sits -- often well under
+    0.25. A variant at ~0.5 or ~1.0 in a tumor is far more likely to be a
+    GERMLINE variant that survived filtering, which is why tumor-only call sets
+    pile up at those fractions: with no matched normal there is nothing to
+    subtract. HCC1395 tumor-only: median AF 0.625 with 116/262 above 0.75,
+    against median 0.079 for the same sample called as a pair.
+
+    Bands are advisory. Purity and local copy number shift all of them, so
+    CLONAL_HET on a 40%-pure sample may be a 100%-clonal variant.
+    """
+    if af is None or (isinstance(af, float) and pd.isna(af)):
+        return None
+    try:
+        v = float(af)
+    except (TypeError, ValueError):
+        return None
+    if v >= 0.85:
+        return "CLONAL_HOM"       # hom, LOH, or germline hom
+    if 0.35 <= v <= 0.65:
+        return "CLONAL_HET"       # one copy in every cell, or germline het
+    if v < 0.25:
+        return "SUBCLONAL"
+    return "INTERMEDIATE"
+
+
 def parse_somatic_vcf(vcf_path):
     """
     Parse a VEP-annotated rescued Mutect2 VCF into a DataFrame.
@@ -697,6 +766,17 @@ def parse_somatic_vcf(vcf_path):
         # FORMAT fields — Mutect2 uses AF (not VAF).
         # Indexed by `ti` (tumor column), not 0 — see the ##tumor_sample note above.
         af = dp = ad_ref = ad_alt = None
+        # GT from the tumor column. Mutect2 emits 0/1 (or 0|1, or 0/1/0 style for
+        # split multiallelics) for essentially every somatic call -- it makes no
+        # ploidy claim about a tumor -- so Zygosity derived from it is constant
+        # and carries no information. Both are kept for traceability; Clonality
+        # below is the column that actually discriminates.
+        gt_raw = None
+        try:
+            _g = var.genotypes[ti]
+            gt_raw = "/".join(str(x) for x in _g[:-1]) if _g else None
+        except Exception:
+            pass
         try:
             arr = var.format("AF")
             if arr is not None:
@@ -774,6 +854,9 @@ def parse_somatic_vcf(vcf_path):
             "HGVSc":               hgvsc,
             "HGVSp":               hgvsp,
             "Transcript":          transcript,
+            "GT":                  gt_raw,
+            "Zygosity":            somatic_zygosity(gt_raw),
+            "Clonality":           somatic_clonality(af),
             "VAF":                 af,
             "AD_Ref":              ad_ref,
             "AD_Alt":              ad_alt,
@@ -973,6 +1056,13 @@ for var in vcf:
 
 df = pd.DataFrame(records)
 
+# Thresholds for the HOM_RARE_CHECK_LOH flag. Calibrated on HCC1395, where the
+# three unflagged common HNF1A homs and the two flagged rare ones (BRCA1, BAG3)
+# sit either side of 5%. Raise HOM_LOH_MAX_GNOMAD_AF to catch more LOH at the
+# cost of flagging ordinary homs.
+HOM_LOH_MIN_VAF = 0.95
+HOM_LOH_MAX_GNOMAD_AF = 0.05
+
 # ---------------------------------------------------------------------------
 # Multiallelic site reconciliation
 # ---------------------------------------------------------------------------
@@ -1041,18 +1131,57 @@ if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
     # calls came from a tumor BAM; on a normal BAM these ratios have ordinary
     # benign explanations and the noise would bury the real signal.
     df["Zygosity_QC"] = ""
-    _src = str(args.germline_source or "")
+    _src  = str(args.germline_source or "")
+    _zyg  = df["Zygosity"].astype(str)
+    _vaf  = pd.to_numeric(df["VAF"], errors="coerce")
+    _gaf  = pd.to_numeric(df.get("gnomAD_AF"), errors="coerce")
+    _flags = [pd.Series("", index=df.index) for _ in range(3)]
+
     if _src.startswith("tumor"):
-        _zyg = df["Zygosity"].astype(str)
-        _vaf = pd.to_numeric(df["VAF"], errors="coerce")
-        _flag = pd.Series("", index=df.index)
-        # A hom call keeping real reference support is not hom-by-descent.
-        _flag = _flag.mask(_zyg.eq("hom") & _vaf.notna() & (_vaf < 0.90),
-                           "HOM_VAF_DISCORDANT")
-        # A het well under the diploid expectation may not be germline at all.
-        _flag = _flag.mask(_zyg.str.startswith("het") & _vaf.notna() & (_vaf < 0.30),
-                           "LOW_VAF_POSSIBLE_SOMATIC")
-        df["Zygosity_QC"] = _flag
+        # (a) A het well under the diploid expectation may not be germline.
+        _flags[0] = _flags[0].mask(
+            _zyg.str.startswith("het") & _vaf.notna() & (_vaf < 0.30),
+            "LOW_VAF_POSSIBLE_SOMATIC")
+
+        # (b) A hom call at a RARE allele. VAF alone cannot separate an ordinary
+        # germline hom from one created by LOH -- both sit at ~1.0, which is why
+        # a "hom with residual ref support" test found none of the five real LOH
+        # events in HCC1395. Population frequency can: under Hardy-Weinberg a
+        # variant at frequency p is homozygous in ~p^2 of people, so a hom at
+        # p=0.98 is expected (PCSK9, p^2=0.97) while a hom at p=1.3e-5 is not
+        # (BRCA1, p^2=1.7e-10) and points to LOH or a somatic variant.
+        #
+        # Common variants that went het->hom via LOH are NOT flagged (HNF1A,
+        # p=0.13-0.43). That is the deliberate trade: they are indistinguishable
+        # from ordinary homs on frequency grounds, and a 1% gnomAD reporting
+        # filter removes them anyway.
+        _rare = _gaf.isna() | (_gaf < HOM_LOH_MAX_GNOMAD_AF)
+        _flags[1] = _flags[1].mask(
+            _zyg.eq("hom") & _vaf.notna() & (_vaf >= HOM_LOH_MIN_VAF) & _rare,
+            "HOM_RARE_CHECK_LOH")
+
+    # (c) Also called by Mutect2. Independent of germline_source, and it means
+    # two different things worth the same second look:
+    #   - genuinely somatic, absent from the germline (HCC1395 TP53 c.524G>A is
+    #     PASS in BOTH the paired and tumor-only somatic VCFs), or
+    #   - germline that Mutect2 could not subtract for want of a matched normal
+    #     (BRCA1 chr17:43057078 is somatic-PASS in tumor-only and ABSENT from
+    #     the paired somatic VCF, where the normal removed it).
+    # Either way the row's provenance is not what the ACMG sheet implies.
+    _som_sites = load_somatic_sites(args.somatic_vcf)
+    if _som_sites and {"Chrom", "Pos", "Ref", "Alt"} <= set(df.columns):
+        _key = list(zip(df["Chrom"].astype(str), df["Pos"].astype(str),
+                        df["Ref"].astype(str).str.upper(),
+                        df["Alt"].astype(str).str.upper()))
+        _hit = pd.Series([k in _som_sites for k in _key], index=df.index)
+        _pass = pd.Series([_som_sites.get(k) == "PASS" for k in _key], index=df.index)
+        _flags[2] = _flags[2].mask(_hit & _pass,  "SOMATIC_VCF_PASS")
+        _flags[2] = _flags[2].mask(_hit & ~_pass, "SOMATIC_VCF_FILTERED")
+
+    df["Zygosity_QC"] = (
+        pd.concat(_flags, axis=1)
+          .apply(lambda r: ";".join(v for v in r if v), axis=1)
+    )
 
 # -------------------------
 # Build tabs
@@ -1186,6 +1315,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     som_cols = [
         "Gene", "Variant", "HGVSc", "HGVSp", "Transcript",
         "Consequence", "Impact",
+        "GT", "Zygosity", "Clonality",
         "VAF", "AD_Ref", "AD_Alt", "DP",
         "TLOD", "POPAF",
         "gnomAD_AF",
@@ -1194,7 +1324,8 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "REVEL", "SpliceAI_DS_max", "SpliceAI_Event",
         "BayesDel_score", "AM_Pathogenicity", "AM_Class",
     ]
-    empty_som_cols = ["Gene","Variant","Consequence","VAF","AD_Alt","DP","TLOD","ClinVar"]
+    empty_som_cols = ["Gene","Variant","Consequence","GT","Zygosity","Clonality",
+                      "VAF","AD_Alt","DP","TLOD","ClinVar"]
 
     def _posthoc_reason(r):
         """Which post-hoc threshold(s) rejected an otherwise-PASS call.
