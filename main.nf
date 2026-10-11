@@ -415,7 +415,7 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
             }
 
         // Run post-processing (no somatic VCF in this path)
-        POST_SAREK(vcf_ch, bam_ch, bed_ch, Channel.empty())
+        POST_SAREK(vcf_ch, bam_ch, bed_ch, Channel.empty(), Channel.empty())
 }
 
 workflow RUN_FROM_POST_SAMPLESHEET {
@@ -469,7 +469,7 @@ workflow RUN_FROM_POST_SAMPLESHEET {
         bam_ch.view { s, a, i -> "🧬 BAM -> ${s} :: ${a.name}" }
 
         // Run post-processing (no consensus for post-samplesheet)
-        POST_SAREK(vcf_ch, bam_ch, bed_ch, Channel.empty())
+        POST_SAREK(vcf_ch, bam_ch, bed_ch, Channel.empty(), Channel.empty())
 }
 
 workflow RUN_FULL_VARIANT_CALLING {
@@ -669,9 +669,23 @@ workflow RUN_FULL_VARIANT_CALLING {
             // post-hoc thresholds are applied in the report script, which infers
             // paired vs tumor-only from the VCF's own ##tumor_sample header.
             def somatic_bed_ch = Channel.value(validateSomaticBedFile())
-            POST_SAREK_SOMATIC(vcf_with_meta_ch, somatic_bed_ch)
+
+            // The TUMOR BAM, for the somatic strand-bias pileup. Keyed by the
+            // tumor sample name, which is how vcf_with_meta_ch is keyed, so it
+            // is the plain (non-_germline) entry in both cases: for a paired
+            // patient this is a DIFFERENT library from the normal BAM the
+            // germline arm uses.
+            def tumor_bam_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.bam
+                .filter { sample, bam, bai -> !sample.endsWith('_germline') }
+                .map { sample, bam, bai ->
+                    def meta = [ sample: sample, assay: assayMap.get(sample, 'NA') ]
+                    tuple(meta, bam, bai)
+                }
+
+            POST_SAREK_SOMATIC(vcf_with_meta_ch, somatic_bed_ch, tumor_bam_ch)
 
             def somatic_vep_ch = POST_SAREK_SOMATIC.out.somatic_vep
+            def somatic_sb_ch  = POST_SAREK_SOMATIC.out.somatic_sb
 
             // ── HC VCF collection — all filtered VCFs from haplotypecaller output ──
             def all_hc_vcf_ch = NFCORE_SAREK.out.multiqc_report
@@ -747,9 +761,9 @@ workflow RUN_FULL_VARIANT_CALLING {
             }
 
             // POST_SAREK: HC germline VCF (ACMG SF) + somatic VEP — both keyed by tumor name
-            POST_SAREK(hc_germline_vcf_ch, hc_germline_bam_ch, bed_ch, somatic_vep_ch)
+            POST_SAREK(hc_germline_vcf_ch, hc_germline_bam_ch, bed_ch, somatic_vep_ch, somatic_sb_ch)
         } else {
-            POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch, Channel.empty())
+            POST_SAREK(vcf_with_meta_ch, bam_with_meta_ch, bed_ch, Channel.empty(), Channel.empty())
         }
 }
 

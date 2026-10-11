@@ -13,6 +13,13 @@ params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/templ
 params.run_vep     = params.run_vep     ?: true
 params.min_dp   = params.min_dp   ?: 10
 params.min_qual = params.min_qual ?: 10
+// Flag threshold for the SOMATIC strand-bias test. Kept at the germline default
+// rather than invented: a Mutect2 call at VAF 0.05 has ~5 alt reads and cannot
+// reach ANY small p, so loosening the threshold would not rescue it -- it would
+// only start flagging well-powered calls. Those rows come back UNDERPOWERED and
+// the raw ALT_FWD/ALT_REV counts are the usable signal. Tune once there is real
+// output to calibrate against.
+params.somatic_sb_p = params.somatic_sb_p ?: 1e-4
 // VEP resource params expected from main/config:
 // params.vep_fasta, params.revel_vcf, params.alpha_missense_vcf, params.clinvar_vcf
 
@@ -405,6 +412,118 @@ process VEP_Annotate {
   """
 }
 
+process StrandBiasPileup {
+  tag { "${meta.sample} (${meta.assay})" }
+  input:
+    // raw_bam is the full markduplicates BAM, NOT the BED-filtered one. At a
+    // panel position the two give identical counts -- a read overlapping a
+    // panel base overlaps the BED by definition -- so using the raw BAM costs
+    // nothing and avoids depending on BedFilterBAM's output.
+    //
+    // No BAM index is taken. main.nf builds the .bai path by string
+    // concatenation and never verifies it on GCS (checkIfExists: false), so it
+    // can point at a file that does not exist. --targets-file streams the BAM
+    // instead of seeking, which needs no index; the bcftools container has no
+    // samtools, so this process could not build one anyway.
+    tuple val(meta), path(vep_vcf), path(raw_bam)
+    path fasta
+    path fai
+  output:
+    tuple val(meta), path("${meta.sample}_mpileup_adf_adr.tsv")
+  script:
+    def sample = meta.sample
+  """
+  set -euo pipefail
+
+  # Sites to test are the annotated panel variants. Unlike the germline branch
+  # there is no Exomiser tab and no off-panel set here, so the VEP VCF is the
+  # whole question -- and its positions are already in reference order, so no
+  # re-sorting or hash join is needed.
+  bcftools query -f '%CHROM\t%POS\n' $vep_vcf | uniq > regions.txt
+
+  # Deliberately NOT `bcftools call -C alleles`. Constraining the pileup to the
+  # caller's alleles matches more indels, but `call` makes a GENOTYPE decision,
+  # and when alt support is weak and one-sided it calls the site hom-ref and
+  # drops the ALT entirely -- exactly the artifact class this check exists to
+  # find. Plain mpileup reports what it sees and lets the Fisher test decide.
+  bcftools mpileup \
+    --targets-file regions.txt \
+    --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \
+    --fasta-ref $fasta \
+    --min-BQ 13 --min-MQ 0 --no-BAQ --max-depth 8000 \
+    -Ou $raw_bam \
+  | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%ADF\t%ADR]\n' \
+  > ${sample}_mpileup_adf_adr.tsv
+  """
+}
+
+process StrandBiasTest {
+  tag { "${meta.sample} (${meta.assay})" }
+  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
+  input:
+    tuple val(meta), path(pileup), path(vcf)
+    each path(script)
+  output:
+    tuple val(meta), path("${meta.sample}_strand_bias.tsv")
+  script:
+    def sample = meta.sample
+  """
+  python3 ${script} \
+    --mpileup ${pileup} \
+    --vcf $vcf \
+    --out ${sample}_strand_bias.tsv
+  """
+}
+
+process StrandBiasPileupSomatic {
+  tag { "${meta.sample}" }
+  input:
+    // The TUMOR BAM. For a paired sample this is a DIFFERENT library from the
+    // one the germline arm pileups (that one uses the matched normal), so a
+    // paired run performs two pileups -- which is correct: somatic calls were
+    // made from the tumor and must be checked against it.
+    tuple val(meta), path(somatic_vcf), path(tumor_bam)
+    path fasta
+    path fai
+  output:
+    tuple val(meta), path("${meta.sample}_somatic_mpileup_adf_adr.tsv")
+  script:
+    def sample = meta.sample
+  """
+  set -euo pipefail
+
+  bcftools query -f '%CHROM\t%POS\n' $somatic_vcf | uniq > regions.txt
+
+  bcftools mpileup \
+    --targets-file regions.txt \
+    --annotate FORMAT/AD,FORMAT/ADF,FORMAT/ADR \
+    --fasta-ref $fasta \
+    --min-BQ 13 --min-MQ 0 --no-BAQ --max-depth 8000 \
+    -Ou $tumor_bam \
+  | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%ADF\t%ADR]\n' \
+  > ${sample}_somatic_mpileup_adf_adr.tsv
+  """
+}
+
+process StrandBiasTestSomatic {
+  tag { "${meta.sample}" }
+  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
+  input:
+    tuple val(meta), path(pileup), path(vcf)
+    each path(script)
+  output:
+    tuple val(meta), path("${meta.sample}_somatic_strand_bias.tsv")
+  script:
+    def sample = meta.sample
+  """
+  python3 ${script} \
+    --mpileup ${pileup} \
+    --vcf $vcf \
+    --p-threshold ${params.somatic_sb_p} \
+    --out ${sample}_somatic_strand_bias.tsv
+  """
+}
+
 process LeanReport {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay   
   publishDir "${params.outdir}/${meta.sample}/reports", mode: 'copy'
@@ -416,13 +535,16 @@ process LeanReport {
           path(sex_check),
           path(gaps20), path(gaps30),
           path(thresholds),
-          path(somatic_vcf)
+          path(strand_bias),
+          path(somatic_vcf),
+          path(somatic_sb)
     each path(script)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants_lean.xlsx")
   script:
     def sample  = meta.sample
     def som_arg = somatic_vcf.name != 'NO_FILE' ? "--somatic-vcf ${somatic_vcf}" : ""
+    def som_sb_arg = somatic_sb.name != 'NO_FILE' ? "--somatic-strand-bias ${somatic_sb}" : ""
     // Which BAM produced the germline/ACMG calls. Set per-sample in main.nf for
     // somatic runs; a plain germline run has one sample and no ambiguity.
     def gsrc    = meta.germline_source ?: 'germline (single sample)'
@@ -436,8 +558,9 @@ process LeanReport {
     --acmg-thresholds ${thresholds} \
     --sexcheck ${sex_check} \
     --gaps20 ${gaps20} --gaps30 ${gaps30} \
+    --strand-bias ${strand_bias} \
     --germline-source '${gsrc}' \
-    ${som_arg}
+    ${som_arg} ${som_sb_arg}
   """
 }
 
@@ -562,6 +685,7 @@ workflow POST_SAREK {
     bam_ch          // tuple(meta, bam, bai)
     bed_ch          // value channel with BED
     somatic_vcf_ch  // tuple(meta, somatic_vep_vcf) — pass Channel.empty() if not somatic mode
+    somatic_sb_ch   // tuple(meta, somatic_strand_bias_tsv) — Channel.empty() if not somatic mode
 
   main:
     // join per-sample → (s//ample, vcf, bam, bai)
@@ -620,6 +744,27 @@ workflow POST_SAREK {
     SexCheck(bam_sample_ch.map { s, bam, bai -> tuple(s, bam) })
     BcftoolsStats(vep_ch.map { s, vcf -> tuple(s, vcf) })
 
+    // Raw-alignment strand bias. Advisory only -- flagged, never dropped. The
+    // caller's own FS is computed after local reassembly and can badly
+    // understate the skew, so this recomputes per-allele forward/reverse counts
+    // straight from the BAM with bcftools mpileup.
+    //
+    // The BAM here is whichever one produced the germline calls: the matched
+    // NORMAL for a paired sample, the tumor for tumor-only (see
+    // Germline_Source). That is the correct pairing -- the pileup must come
+    // from the library the genotypes came from.
+    strand_bias_script_ch = Channel.fromPath("${params.scriptdir}/strand_bias.py").first()
+    sb_input_ch = vep_ch
+      .map { meta, vcf -> tuple(meta.sample, meta, vcf) }
+      .join(sample_inputs.map { meta, vcf, bam, bai -> tuple(meta.sample, bam) }, remainder: true)
+      // remainder:true also emits right-only rows (a sample in one channel but
+      // not the other); drop anything missing the VCF or BAM the pileup needs.
+      .filter { it[1] != null && it[2] != null && it[3] != null }
+      .map { sample, meta, vep, bam -> tuple(meta, vep, bam) }
+
+    StrandBiasPileup(sb_input_ch, norm_fasta_ch, norm_fai_ch)
+    StrandBiasTest(StrandBiasPileup.out.join(vep_ch), strand_bias_script_ch)
+
     // prepare joins keyed by sample
     exon_cov_ch         = CoverageSummary.out.map { s, summary -> tuple(s, summary) }
     gaps20_ch           = CoverageGapsAnnotation.out.map { s, a20, a30 -> tuple(s, a20) }
@@ -640,6 +785,7 @@ workflow POST_SAREK {
       .join(gaps20_ch)
       .join(gaps30_ch)
       .join(thresholds_ch)
+      .join(StrandBiasTest.out)
 
     // somatic_vcf_ch is OPTIONAL and comes from a different subworkflow, so its
     // meta is built independently -- it carries no germline_source, while the
@@ -652,16 +798,20 @@ workflow POST_SAREK {
     // agree on by construction, and it stays correct if either meta gains a
     // field later.
     som_keyed_ch = somatic_vcf_ch.map { meta, somatic_vcf -> tuple(meta.sample, somatic_vcf) }
+    som_sb_keyed_ch = somatic_sb_ch.map { meta, tsv -> tuple(meta.sample, tsv) }
 
     lean_input_ch = qc_joined_ch
       .map { items -> tuple(items[0].sample, items) }
       .join(som_keyed_ch, remainder: true)
+      .join(som_sb_keyed_ch, remainder: true)
       // A somatic VCF with no matching QC chain would arrive with items == null.
       // That should be impossible (both derive from the same sample set) but
       // dropping it is cheaper than a confusing failure 15 hours in.
-      .filter { sample, items, somatic_vcf -> items != null }
-      .map { sample, items, somatic_vcf ->
-          items + [ somatic_vcf != null ? somatic_vcf : file("${projectDir}/assets/NO_FILE") ]
+      .filter { sample, items, somatic_vcf, somatic_sb -> items != null }
+      .map { sample, items, somatic_vcf, somatic_sb ->
+          def no_file = file("${projectDir}/assets/NO_FILE")
+          items + [ somatic_vcf != null ? somatic_vcf : no_file,
+                    somatic_sb  != null ? somatic_sb  : no_file ]
       }
     LeanReport(lean_input_ch, script_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
@@ -673,6 +823,7 @@ workflow POST_SAREK_SOMATIC {
   take:
     vcf_ch          // tuple(meta, rescued_vcf) — output of MUTECT2_RESCUE (with meta)
     somatic_bed_ch  // value channel with the somatic reporting panel BED
+    tumor_bam_ch    // tuple(meta, bam, bai) — the TUMOR BAM, keyed by tumor sample
 
   main:
     // Restrict to the reporting panel first — everything downstream, VEP
@@ -713,8 +864,21 @@ workflow POST_SAREK_SOMATIC {
       file(params.vep_plugins)
     ) : NormalizeSomatic.out
 
+    // Raw-alignment strand bias on the somatic calls, against the tumor BAM.
+    somatic_sb_script_ch = Channel.fromPath("${params.scriptdir}/strand_bias.py").first()
+    som_sb_input_ch = somatic_vep_ch
+      .map { meta, vcf -> tuple(meta.sample, meta, vcf) }
+      .join(tumor_bam_ch.map { meta, bam, bai -> tuple(meta.sample, bam) }, remainder: true)
+      .filter { it[1] != null && it[2] != null && it[3] != null }
+      .map { sample, meta, vcf, bam -> tuple(meta, vcf, bam) }
+
+    StrandBiasPileupSomatic(som_sb_input_ch, som_fasta_ch, som_fai_ch)
+    StrandBiasTestSomatic(StrandBiasPileupSomatic.out.join(somatic_vep_ch),
+                          somatic_sb_script_ch)
+
   emit:
     // tuple(meta, <sample>.somatic.vep.vcf) — every in-panel call, annotated,
     // FILTER preserved. The report script derives the reported and QC views.
     somatic_vep = somatic_vep_ch
+    somatic_sb  = StrandBiasTestSomatic.out
 }

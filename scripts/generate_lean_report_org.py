@@ -30,6 +30,17 @@ p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
 p.add_argument("--gaps30", default=None, help="annotated gaps <30x BED (chrom start end RegionLabel)")
+p.add_argument("--strand-bias", default=None,
+               help="strand_bias.py TSV: per-variant ALT_FWD/ALT_REV and a Fisher exact p "
+                    "recomputed from the RAW alignment. The caller's own FS is computed after "
+                    "local reassembly and can badly understate the skew. Advisory only -- "
+                    "flagged, never used to drop a variant.")
+p.add_argument("--somatic-strand-bias", default=None,
+               help="strand_bias.py TSV for the SOMATIC calls, pileuped against the TUMOR BAM "
+                    "(a different library from --strand-bias for a paired sample). Adds "
+                    "ALT_FWD/ALT_REV/StrandBias_P/StrandBias to the somatic sheets. Expect many "
+                    "UNDERPOWERED rows: a call at VAF 0.05 has too few alt reads for the test to "
+                    "reach any small p, and the raw counts are the usable signal there.")
 p.add_argument("--germline-source", default=None,
                help="Which BAM produced the germline/ACMG calls in this report. "
                     "'normal:<name>' for a tumor/normal pair, 'tumor (tumor-only)' "
@@ -1060,6 +1071,14 @@ df = pd.DataFrame(records)
 # three unflagged common HNF1A homs and the two flagged rare ones (BRCA1, BAG3)
 # sit either side of 5%. Raise HOM_LOH_MAX_GNOMAD_AF to catch more LOH at the
 # cost of flagging ordinary homs.
+# Germline-leakage flag on the SOMATIC sheets. A somatic mutation is private to
+# the tumor and so essentially absent from population databases; a reported
+# somatic call that IS in the population is far more likely germline that the
+# caller could not subtract. POPAF is Mutect2's own -log10(population AF), used
+# where VEP's gnomAD_AF is missing (POPAF 3 == AF 1e-3).
+SOMATIC_GERMLINE_MIN_GNOMAD_AF = 1e-4
+SOMATIC_GERMLINE_MAX_POPAF = 3.0
+
 HOM_LOH_MIN_VAF = 0.95
 HOM_LOH_MAX_GNOMAD_AF = 0.05
 
@@ -1183,6 +1202,52 @@ if len(df) and {"Chrom", "Pos", "AD_Ref", "AD_Alt"} <= set(df.columns):
           .apply(lambda r: ";".join(v for v in r if v), axis=1)
     )
 
+    # ---- Strand bias (raw alignment) -----------------------------------
+    # Joined on coordinates + alleles from strand_bias.py. Advisory only.
+    #
+    # StrandBias carries the OUTCOME in words, because three very different
+    # situations otherwise render identically in Excel as an empty cell or a
+    # high p-value:
+    #   PASS              tested with enough reads to have found skew
+    #   STRAND_BIAS       p < 1e-4
+    #   UNDERPOWERED      too few alt reads for ANY split to reach the
+    #                     threshold -- absence of evidence, not evidence of
+    #                     absence. Expect this often on tumor data, where real
+    #                     somatic variants sit at low VAF with few alt reads.
+    #   NOT_TESTED_*      hom-ALT, unreconciled indel, or no usable pileup
+    # A reviewer reading a blank cell as "no problem" is exactly the failure
+    # this check exists to prevent, so the status is never left implicit.
+    df["ALT_FWD"] = pd.NA
+    df["ALT_REV"] = pd.NA
+    df["StrandBias_P"] = pd.NA
+    # NOT_RUN distinguishes "the check was never invoked" from "invoked and
+    # found nothing for this variant".
+    df["StrandBias"] = "NOT_RUN"
+    if args.strand_bias and os.path.exists(args.strand_bias) \
+       and os.path.getsize(args.strand_bias) > 0:
+        df["StrandBias"] = "NOT_TESTED_NO_PILEUP"
+        try:
+            _sb = pd.read_csv(args.strand_bias, sep="\t", dtype=str)
+            _sb = _sb.drop_duplicates(subset=["CHROM", "POS", "REF", "ALT"])
+            _sb_idx = _sb.set_index(["CHROM", "POS", "REF", "ALT"])
+            _sb_keys = list(zip(df["Chrom"].astype(str), df["Pos"].astype(str),
+                                df["Ref"].astype(str), df["Alt"].astype(str)))
+            for _i, _k in zip(df.index, _sb_keys):
+                if _k not in _sb_idx.index:
+                    continue
+                _row = _sb_idx.loc[_k]
+                df.at[_i, "ALT_FWD"] = _row["ALT_FWD"]
+                df.at[_i, "ALT_REV"] = _row["ALT_REV"]
+                df.at[_i, "StrandBias_P"] = _row["StrandBias_P"]
+                df.at[_i, "StrandBias"] = _row["StrandBias_Flag"]
+        except Exception:
+            pass
+
+for _c in ("ALT_FWD", "ALT_REV", "StrandBias_P", "StrandBias",
+           "Multiallelic", "Site_AD_Total", "Zygosity_QC"):
+    if _c not in df.columns:
+        df[_c] = "NOT_RUN" if _c == "StrandBias" else pd.NA
+
 # -------------------------
 # Build tabs
 # -------------------------
@@ -1250,7 +1315,9 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         "Consequence","Exon","Intron","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","ClinVar_Link","gnomAD_AF","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
         # Site-level reconciliation of split multiallelics -- VAF above is
         # computed against Site_AD_Total, not AD_Ref+AD_Alt.
-        "Multiallelic","Site_AD_Total","Zygosity_QC"
+        "Multiallelic","Site_AD_Total","Zygosity_QC",
+        # Raw-alignment strand bias: advisory, never a filter. See strand_bias.py.
+        "ALT_FWD","ALT_REV","StrandBias_P","StrandBias"
     ]
     acmg[acmg_cols].to_excel(xw, index=False, sheet_name="ACMG SF (P-LP)")
 
@@ -1301,7 +1368,9 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     pass_cols = [
         "Variant","Gene","HGVSc","HGVSp","MANE_ID","Transcript","Consequence","GT","Zygosity","AD_Ref","AD_Alt","DP","GQ","QUAL",
         "FILTER","VAF","gnomAD_AF","ClinVar","ClinVar_ReviewStatus","ClinVar_Stars","ClinVar_StarsGlyph","REVEL","SpliceAI_DS_max","SpliceAI_Event","BayesDel_score","AM_Pathogenicity","AM_Class","HGVS_full",
-        "Multiallelic","Site_AD_Total","Zygosity_QC"
+        "Multiallelic","Site_AD_Total","Zygosity_QC",
+        # Raw-alignment strand bias: advisory, never a filter. See strand_bias.py.
+        "ALT_FWD","ALT_REV","StrandBias_P","StrandBias"
     ]
     df[df["FILTER"]=="PASS"][pass_cols].to_excel(xw, index=False, sheet_name="PASS variants")
 
@@ -1315,17 +1384,19 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     som_cols = [
         "Gene", "Variant", "HGVSc", "HGVSp", "Transcript",
         "Consequence", "Impact",
-        "GT", "Zygosity", "Clonality",
+        "GT", "Zygosity", "Clonality", "Germline_QC",
         "VAF", "AD_Ref", "AD_Alt", "DP",
         "TLOD", "POPAF",
         "gnomAD_AF",
         "ClinVar", "ClinVar_ReviewStatus", "ClinVar_Stars", "ClinVar_StarsGlyph",
         "ClinVar_Link",
+        # Raw-alignment strand bias against the TUMOR BAM: advisory, never a filter.
+        "ALT_FWD", "ALT_REV", "StrandBias_P", "StrandBias",
         "REVEL", "SpliceAI_DS_max", "SpliceAI_Event",
         "BayesDel_score", "AM_Pathogenicity", "AM_Class",
     ]
     empty_som_cols = ["Gene","Variant","Consequence","GT","Zygosity","Clonality",
-                      "VAF","AD_Alt","DP","TLOD","ClinVar"]
+                      "Germline_QC","VAF","AD_Alt","DP","TLOD","ClinVar"]
 
     def _posthoc_reason(r):
         """Which post-hoc threshold(s) rejected an otherwise-PASS call.
@@ -1353,6 +1424,81 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
             lambda u: f'=HYPERLINK("{u}","{u}")' if u else ""
         )
         som_all_df["PostHoc_Excluded_By"] = som_all_df.apply(_posthoc_reason, axis=1)
+
+        # ---- Germline leakage ------------------------------------------------
+        # Mutect2 subtracts germline variants using the matched normal. Without
+        # one it cannot, so tumor-only call sets carry germline variants at
+        # ~0.5 and ~1.0 AF (HCC1395 tumor-only: 105/262 CLONAL_HOM against
+        # 3/47 for the same sample called as a pair). Paired runs are not immune
+        # either: they SKIP the post-hoc POPAF threshold, so CDH1
+        # chr16:68834619 -- gnomAD 17.8%, ClinVar Benign -- is reported as
+        # somatic there with no population guard at all.
+        _sg_gaf = pd.to_numeric(som_all_df.get("gnomAD_AF"), errors="coerce")
+        _sg_pop = pd.to_numeric(som_all_df.get("POPAF"), errors="coerce")
+        _in_pop = (
+            (_sg_gaf >= SOMATIC_GERMLINE_MIN_GNOMAD_AF)
+            | (_sg_gaf.isna() & _sg_pop.notna() & (_sg_pop < SOMATIC_GERMLINE_MAX_POPAF))
+        )
+
+        # Also called by the germline caller. Decisive only for a PAIRED run,
+        # where that call set comes from the matched NORMAL. In tumor-only both
+        # callers read the same tumor BAM, so overlap is expected for any
+        # variant with decent support -- the genuinely somatic TP53 c.524G>A
+        # appears in both. Scope is also limited: only 18 of the 125 somatic
+        # panel genes are in the 84-gene germline BED, so this can never fire
+        # for the other 107.
+        _germ_sites = set()
+        if len(df) and {"Chrom", "Pos", "Ref", "Alt"} <= set(df.columns):
+            _germ_sites = set(zip(df["Chrom"].astype(str), df["Pos"].astype(str),
+                                  df["Ref"].astype(str).str.upper(),
+                                  df["Alt"].astype(str).str.upper()))
+        _paired = not str(args.germline_source or "").startswith("tumor")
+        _sg_hit = pd.Series(False, index=som_all_df.index)
+        if _germ_sites and {"Chrom", "Pos", "Ref", "Alt"} <= set(som_all_df.columns):
+            _sg_hit = pd.Series(
+                [(c, str(pp), str(r).upper(), str(al).upper()) in _germ_sites
+                 for c, pp, r, al in zip(som_all_df["Chrom"].astype(str),
+                                         som_all_df["Pos"],
+                                         som_all_df["Ref"], som_all_df["Alt"])],
+                index=som_all_df.index)
+
+        _gq = [pd.Series("", index=som_all_df.index) for _ in range(2)]
+        _gq[0] = _gq[0].mask(_in_pop, "GERMLINE_FREQ")
+        _gq[1] = _gq[1].mask(
+            _sg_hit,
+            "GERMLINE_CALLED_IN_NORMAL" if _paired else "ALSO_IN_GERMLINE_CALLSET")
+        # ---- Strand bias on the somatic calls (raw tumor alignment) ----------
+        # Same test as the germline sheets, different pileup: this one is run
+        # against the TUMOR BAM. See --somatic-strand-bias on UNDERPOWERED.
+        som_all_df["ALT_FWD"] = pd.NA
+        som_all_df["ALT_REV"] = pd.NA
+        som_all_df["StrandBias_P"] = pd.NA
+        som_all_df["StrandBias"] = "NOT_RUN"
+        _ssb = args.somatic_strand_bias
+        if _ssb and os.path.exists(_ssb) and os.path.getsize(_ssb) > 0:
+            som_all_df["StrandBias"] = "NOT_TESTED_NO_PILEUP"
+            try:
+                _st = pd.read_csv(_ssb, sep="\t", dtype=str)
+                _st = _st.drop_duplicates(subset=["CHROM", "POS", "REF", "ALT"])
+                _st_idx = _st.set_index(["CHROM", "POS", "REF", "ALT"])
+                _st_keys = list(zip(som_all_df["Chrom"].astype(str),
+                                    som_all_df["Pos"].astype(str),
+                                    som_all_df["Ref"].astype(str),
+                                    som_all_df["Alt"].astype(str)))
+                for _i, _k in zip(som_all_df.index, _st_keys):
+                    if _k not in _st_idx.index:
+                        continue
+                    _r = _st_idx.loc[_k]
+                    som_all_df.at[_i, "ALT_FWD"] = _r["ALT_FWD"]
+                    som_all_df.at[_i, "ALT_REV"] = _r["ALT_REV"]
+                    som_all_df.at[_i, "StrandBias_P"] = _r["StrandBias_P"]
+                    som_all_df.at[_i, "StrandBias"] = _r["StrandBias_Flag"]
+            except Exception:
+                pass
+
+        som_all_df["Germline_QC"] = (
+            pd.concat(_gq, axis=1).apply(lambda r: ";".join(v for v in r if v), axis=1)
+        )
 
         present_cols = [c for c in som_cols if c in som_all_df.columns]
 
