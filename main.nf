@@ -13,6 +13,8 @@ include { NFCORE_SAREK } \
 include { POST_SAREK } \
   from './modules/vep.nf'
 
+include { FilterConsensusVCF } \
+    from './modules/consensus.nf'
 include { CONSENSUS_CALLING } \
   from './modules/consensus.nf'
 
@@ -49,6 +51,41 @@ params.run_id                 = params.run_id ?: null
 // externally-supplied null cannot be overwritten). Resolved instead by
 // resolveRefFasta() at the point of use, which errors clearly if unset.
 params.ref_fasta              = params.ref_fasta ?: null
+
+// Which half of the pipeline to run.
+//
+//   calling    FASTQ/BAM -> Sarek -> DeepVariant + HaplotypeCaller -> consensus
+//              VCF. Stops there. Needs NO panel inputs at all: no --bed, no
+//              --sf_genes, no --phenotypes, no VEP resources. This is the
+//              deliverable for a customer who wants variants, not a report.
+//
+//   reporting  consensus VCF + RAW BAM -> annotation, Exomiser and the Excel
+//              report. Takes --reporting_input, a CSV of
+//              sample,raw_vcf,raw_tbi,bam,bai.
+//
+//              The RAW consensus is the handover, not the filtered one: it is
+//              what Exomiser needs (it ranks genome-wide, and the filtered VCF
+//              is panel-restricted) and what strand_bias.py needs for off-panel
+//              REF/ALT and AD. The filtered VCF is re-derived here by
+//              FilterConsensusVCF, so the tiered CALLERS thresholds live in one
+//              place and the customer hands over one VCF rather than two.
+//
+//              The BAM must be the RAW alignment, not a panel-filtered one:
+//              BedFilterBAM does the panel restriction itself, and
+//              StrandBiasPileup deliberately reads the unfiltered BAM so
+//              off-panel variants are not left blank.
+//
+//   full       both, as a single run. The default, so existing invocations are
+//              unaffected.
+params.stage                  = params.stage ?: 'full'
+params.reporting_input        = params.reporting_input ?: null
+
+if (!(params.stage in ['full', 'calling', 'reporting'])) {
+    error "❌ --stage must be one of: full, calling, reporting (got '${params.stage}')"
+}
+if (params.stage == 'reporting' && !params.reporting_input) {
+    error "❌ --stage reporting requires --reporting_input (CSV: sample,raw_vcf,raw_tbi,bam,bai[,assay])"
+}
 //params.vep_fasta              = params.vep_fasta ?: params.vep_fasta
 
 // Validate required parameters
@@ -392,6 +429,88 @@ workflow RUN_FROM_POST_SAMPLESHEET {
         POST_SAREK(Channel.empty(), Channel.empty(), vcf_ch, bam_ch, bed_ch)
 }
 
+// Second half: consensus VCF + raw BAM -> annotation, Exomiser, report.
+// Mirrors the tail of RUN_FULL_VARIANT_CALLING rather than re-deriving it, so
+// the two entry points produce the same sheets from the same code.
+workflow RUN_REPORTING {
+    take:
+        bed_ch
+
+    main:
+        log.info """
+        ╔════════════════════════════════════════════════════════════╗
+        ║  Stage: REPORTING only                                     ║
+        ║  Input: ${params.reporting_input}
+        ╚════════════════════════════════════════════════════════════╝
+        """.stripIndent()
+
+        // CSV: sample,raw_vcf,raw_tbi,bam,bai,assay
+        // raw_tbi and bai default to <file>.tbi / <file>.bai. Both are verified
+        // for local paths; on GCS `file()` cannot cheaply confirm existence, so
+        // a wrong path there fails at stage-in with a clear Nextflow error
+        // rather than silently producing an empty channel.
+        def rows_ch = Channel
+            .fromPath(params.reporting_input, checkIfExists: true)
+            .splitCsv(header: true)
+            .map { row ->
+                if (!row.sample)  error "❌ --reporting_input row missing 'sample': ${row}"
+                if (!row.raw_vcf) error "❌ --reporting_input row missing 'raw_vcf': ${row}"
+                if (!row.bam)     error "❌ --reporting_input row missing 'bam': ${row}"
+
+                def v  = file(row.raw_vcf)
+                def vt = file(row.raw_tbi ?: "${row.raw_vcf}.tbi")
+                def b  = file(row.bam)
+                def bi = file(row.bai ?: "${row.bam}.bai")
+
+                if (!row.raw_vcf.startsWith('gs://')) {
+                    if (!v.exists())  error "❌ VCF not found: ${v}"
+                    if (!vt.exists()) error "❌ VCF index not found: ${vt}"
+                    if (!b.exists())  error "❌ BAM not found: ${b}"
+                    if (!bi.exists()) error "❌ BAI not found: ${bi}"
+                }
+                // assay comes from the CSV, not params.input: assayMap is built
+                // from the calling samplesheet, which a reporting-only run does
+                // not have. Optional, defaults to NA like the full-run fallback.
+                tuple(row.sample, v, vt, b, bi, (row.assay ?: 'NA'))
+            }
+
+        // The handover is the RAW consensus; re-derive the filtered VCF here so
+        // the CALLERS-tiered thresholds are applied by the same process that
+        // applies them in a full run.
+        FilterConsensusVCF(rows_ch.map { s, v, vt, b, bi, assay -> tuple(s, v, vt) })
+
+        // assay per sample, so vcf_with_meta_ch can carry the same meta MAP the
+        // other channels do -- POST_SAREK joins on that map, and a mismatched
+        // key silently matches nothing.
+        def assay_ch = rows_ch.map { sample, v, vt, b, bi, assay -> tuple(sample, assay) }
+
+        def vcf_with_meta_ch = FilterConsensusVCF.out
+            .join(assay_ch)
+            .map { sample, vcf, assay -> tuple([ sample: sample, assay: assay ], vcf) }
+
+        def bam_with_meta_ch = rows_ch
+            .map { sample, v, vt, b, bi, assay ->
+                tuple([ sample: sample, assay: assay ], b, bi) }
+
+        def raw_cons_keyed_ch = rows_ch
+            .map { sample, v, vt, b, bi, assay ->
+                tuple([ sample: sample, assay: assay ], v, vt) }
+
+        exomiser_tsv_ch = Channel.empty()
+        if (params.run_exomiser && params.phenotypes) {
+            EXOMISER(rows_ch.map { sample, v, vt, b, bi, assay ->
+                tuple([ sample: sample, assay: assay ], v, vt) })
+            exomiser_tsv_ch = EXOMISER.out.reports
+                .flatten()
+                .filter { f -> f.name.endsWith('_exomiser.variants.tsv') }
+                .map    { f -> tuple(f.name.replaceFirst(/_exomiser\.variants\.tsv$/, ''), f) }
+        } else if (params.run_exomiser) {
+            log.warn "Exomiser skipped: --stage reporting needs --phenotypes."
+        }
+
+        POST_SAREK(exomiser_tsv_ch, raw_cons_keyed_ch, vcf_with_meta_ch, bam_with_meta_ch, bed_ch)
+}
+
 workflow RUN_FULL_VARIANT_CALLING {
     take:
         bed_ch
@@ -546,6 +665,21 @@ workflow RUN_FULL_VARIANT_CALLING {
             log.warn "params.run_db_qc=false → skipping run_output_manifest.tsv (QC Gate JSON is required to populate qc_status / qc_recommendation)."
         }
 
+        // --stage calling stops here: the consensus VCF, the QC export and the
+        // run manifest are the deliverable. Everything below is panel-scoped
+        // annotation and reporting.
+        if (params.stage == 'calling') {
+            log.info """
+            ╔════════════════════════════════════════════════════════════╗
+            ║  Stage: CALLING only                                       ║
+            ║  Consensus VCFs are in <outdir>/<sample>/consensus/        ║
+            ║  To report on them later, rerun with:                      ║
+            ║    --stage reporting --reporting_input <csv>               ║
+            ╚════════════════════════════════════════════════════════════╝
+            """.stripIndent()
+            return
+        }
+
         // Exomiser runs BEFORE POST_SAREK so its per-sample TSVs can become the
         // 'Exomiser' and 'Prioritised' tabs. EXOMISER_BATCH carries
         // errorStrategy 'ignore' and POST_SAREK substitutes a NO_FILE
@@ -583,11 +717,18 @@ workflow RUN_FULL_VARIANT_CALLING {
 // ═══════════════════════════════════════════════════════════════════════════
 
 workflow {
-    
-    // Validate and load BED file
-    def bedFile = validateBedFile()
-    bed_ch = Channel.value(bedFile)
-    RUN_FULL_VARIANT_CALLING(bed_ch)
+
+    // --stage calling needs no panel BED at all, so do not demand one. Both
+    // other stages do: validateBedFile() errors clearly if it is missing.
+    if (params.stage == 'calling') {
+        RUN_FULL_VARIANT_CALLING(Channel.empty())
+    }
+    else if (params.stage == 'reporting') {
+        RUN_REPORTING(Channel.value(validateBedFile()))
+    }
+    else {
+        RUN_FULL_VARIANT_CALLING(Channel.value(validateBedFile()))
+    }
     // Route to appropriate sub-workflow
     //if (params.variant_calling_outdir) {
     //    RUN_FROM_VARIANT_CALLING_OUTDIR(params.variant_calling_outdir, bed_ch)

@@ -1,58 +1,78 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/bionl/BioVarFlow/main/nextflow_schema.json",
-  "title": "BioVarFlow parameters",
-  "description": "A germline variant-calling workflow with standardized QC, annotation, and per-sample reports.",
-  "type": "object",
-
-  "$defs": {
-    "io_options": {
-      "title": "Input / Output",
-      "type": "object",
-      "fa_icon": "fas fa-folder-open",
-      "properties": {
-        "input": {
-          "type": "string",
-          "title": "Samplesheet CSV",
-          "description": "CSV file for variant calling input (required).",
-          "mimetype": "text/csv",
-          "format": "file-path",
-          "pattern": "^\\S*\\.csv$"
-        },
-        "input_bam": {
-          "type": "string",
-          "title": "BAM samplesheet (start from mapped data)",
-          "description": "CSV samplesheet with already-mapped BAM files. When provided, the pipeline skips alignment and starts from markduplicates. Required columns: patient, assay,sex, status, sample, bam, bai. Mutually exclusive with --input.",
-          "format": "file-path",
-          "pattern": "^\\S*\\.csv$"
-        },
-        "outdir": {
-          "type": "string",
-          "title": "Output directory",
-          "description": "Where to write results (local path or gs://).",
-          "format": "directory-path"
-        },
-        "phenotypes": {
-            "type": "string",
-            "title": "Phenotypes CSV (Exomiser)",
-            "description": "CSV of HPO terms per sample, used by Exomiser to rank variants genome-wide. Columns: sample,sex,hpo - sex is MALE / FEMALE / UNKNOWN_SEX, hpo is a semicolon-separated list of HPO IDs (e.g. HG003,MALE,HP:0004808;HP:0002863). Exomiser is skipped for any sample not listed.",
-            "mimetype": "text/csv",
-            "format": "file-path",
-            "pattern": "^\\S*\\.csv$"
-        },
-        "run_id": {
-          "type": "string",
-          "title": "Run identifier",
-          "description": "Identifier for this pipeline run. Written into the first column of ${outdir}/manifest/run_output_manifest.tsv. If omitted, Nextflow's auto-generated workflow.runName is used."
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://raw.githubusercontent.com/bionl/BioVarFlow/main/nextflow_schema.json",
+    "title": "BioVarFlow parameters",
+    "description": "A germline variant-calling workflow with standardized QC, annotation, and per-sample reports.",
+    "type": "object",
+    "$defs": {
+        "io_options": {
+            "title": "Input / Output",
+            "type": "object",
+            "fa_icon": "fas fa-folder-open",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "title": "Samplesheet CSV",
+                    "description": "CSV file for variant calling input (required).",
+                    "mimetype": "text/csv",
+                    "format": "file-path",
+                    "pattern": "^\\S*\\.csv$"
+                },
+                "input_bam": {
+                    "type": "string",
+                    "title": "BAM samplesheet (start from mapped data)",
+                    "description": "CSV samplesheet with already-mapped BAM files. When provided, the pipeline skips alignment and starts from markduplicates. Required columns: patient, assay,sex, status, sample, bam, bai. Mutually exclusive with --input.",
+                    "format": "file-path",
+                    "pattern": "^\\S*\\.csv$"
+                },
+                "stage": {
+                    "type": "string",
+                    "default": "full",
+                    "enum": [
+                        "full",
+                        "calling",
+                        "reporting"
+                    ],
+                    "title": "Pipeline stage",
+                    "description": "Which half to run. 'calling': FASTQ/BAM through Sarek to the consensus VCF, and stop - needs no panel BED, gene list, phenotypes or VEP resources. 'reporting': start from a consensus VCF plus its raw BAM and produce the annotated Excel report; requires 'Reporting input'. 'full' (default): both in one run, which is the existing behaviour."
+                },
+                "reporting_input": {
+                    "type": "string",
+                    "format": "file-path",
+                    "mimetype": "text/csv",
+                    "pattern": "^\\S+\\.csv$",
+                    "title": "Reporting input CSV",
+                    "description": "Required when Stage is 'reporting'. Columns: sample,raw_vcf,raw_tbi,bam,bai,assay - raw_tbi and bai default to <file>.tbi / <file>.bai, assay is optional. Hand over the RAW consensus VCF (<sample>.consensus.vcf.gz), not the filtered one: Exomiser ranks genome-wide and strand bias needs off-panel alleles, and the filtered VCF is re-derived automatically. The BAM must be the raw alignment, not a panel-filtered one."
+                },
+                "outdir": {
+                    "type": "string",
+                    "title": "Output directory",
+                    "description": "Where to write results (local path or gs://).",
+                    "format": "directory-path"
+                },
+                "phenotypes": {
+                    "type": "string",
+                    "title": "Phenotypes CSV (Exomiser)",
+                    "description": "CSV of HPO terms per sample, used by Exomiser to rank variants genome-wide. Columns: sample,sex,hpo - sex is MALE / FEMALE / UNKNOWN_SEX, hpo is a semicolon-separated list of HPO IDs (e.g. HG003,MALE,HP:0004808;HP:0002863). Exomiser is skipped for any sample not listed.",
+                    "mimetype": "text/csv",
+                    "format": "file-path",
+                    "pattern": "^\\S*\\.csv$"
+                },
+                "run_id": {
+                    "type": "string",
+                    "title": "Run identifier",
+                    "description": "Identifier for this pipeline run. Written into the first column of ${outdir}/manifest/run_output_manifest.tsv. If omitted, Nextflow's auto-generated workflow.runName is used."
+                }
+            }
         }
-      }
-    }
-  },
-
-  "allOf": [
-    { "$ref": "#/$defs/io_options" }
-  ],
-
-  "required": ["outdir"],
-  "additionalProperties": true
+    },
+    "allOf": [
+        {
+            "$ref": "#/$defs/io_options"
+        }
+    ],
+    "required": [
+        "outdir"
+    ],
+    "additionalProperties": true
 }
