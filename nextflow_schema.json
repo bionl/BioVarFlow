@@ -10,6 +10,7 @@
       "title": "Input / Output",
       "type": "object",
       "fa_icon": "fas fa-folder-open",
+      "required": ["input"],
       "properties": {
         "input": {
           "type": "string",
