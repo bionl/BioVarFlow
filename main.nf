@@ -52,6 +52,34 @@ params.ref_fasta              = params.ref_fasta ?: null
 //params.vep_fasta              = params.vep_fasta ?: params.vep_fasta
 
 // Validate required parameters
+//
+// Fail here, at script-parse time, rather than letting the run proceed. Without
+// this the only thing that catches a missing samplesheet is Sarek's
+// retrieveInput() -- `Can't start mapping step without samplesheet` -- which
+// fires deep inside PIPELINE_INITIALISATION, after the repo clone and submodule
+// update, plugin resolution and download, full config parsing and the params
+// summary. On a cold launch that is many minutes of wall time to be told an
+// argument is missing, and the message names Sarek internals rather than the
+// option to supply.
+//
+// Checking params.input alone is sufficient for both entry styles:
+// nextflow.config assigns `params.input = params.input_bam` when --input_bam is
+// given, and the config is parsed before this script. Deliberately NOT enforced
+// via the schema's `required` list for the same reason -- nf-schema validates
+// the user-supplied params, so an --input_bam-only run would be rejected there
+// even though it is valid.
+if (!params.input) {
+    error """
+    ❌ Missing samplesheet.
+
+       Provide ONE of:
+         --input <samplesheet.csv>      start from FASTQ
+         --input_bam <samplesheet.csv>  start from aligned BAMs
+
+       --samplesheet is accepted as an alias for --input.
+    """.stripIndent()
+}
+
 //if (params.run_variant_calling) {
 //    if (!params.input)  error "❌ Missing --input (samplesheet CSV) when run_variant_calling=true"
 //    if (!params.outdir) error "❌ Missing --outdir when run_variant_calling=true"

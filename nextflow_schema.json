@@ -53,6 +53,6 @@
     { "$ref": "#/$defs/io_options" }
   ],
 
-  "required": ["outdir"],
+  "required": ["outdir", "input"],
   "additionalProperties": true
 }
