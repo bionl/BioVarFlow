@@ -33,9 +33,17 @@ With a PoN supplied, this rewires sarek:
 
 | sarek param | set to | why |
 |---|---|---|
-| `wes` | `true` | without it CNVkit bins exome data as WGS at 20 kb: bivar ~ 1.0 and false whole-chromosome calls |
-| `intervals` | `cnv_targets_bed` | CNVkit hybrid mode needs the capture kit's target BED |
+| `wes` | `true` | this is what selects CNVkit's `--method hybrid`. Without it CNVkit bins exome data as WGS at 20 kb: bivar ~ 1.0 and false whole-chromosome calls |
 | `cnvkit_reference` | `cnv_pon` | stops sarek building its own flat reference from the fasta |
+
+`intervals` is deliberately **not** set. An earlier version of this doc said
+CNVkit hybrid mode needs the capture BED as `--intervals`; that is wrong.
+`--method hybrid` comes from `wes`, and when `--cnvkit_reference` is given
+sarek's cnvkit module sets `reference_exists` and drops `--targets`
+altogether, taking its bins from the `.cnn`. Sarek has no per-tool intervals
+and no interval padding, so setting `intervals` would restrict every caller
+to the BED verbatim and silently drop canonical splice positions from the
+SNV/indel callset. See `docs/sv.md` for the measurements.
 
 Somatic mode forces `tools = mutect2`, so CNV calling does not run there.
 
@@ -45,7 +53,7 @@ Somatic mode forces `tools = mutect2`, so CNV calling does not run there.
 
 | Param | Notes |
 |---|---|
-| `cnv_pon` | CNVkit reference `.cnn` built from this project's own normals, by the customer or a separate PoN pipeline. Must come from the same BED as `cnv_targets_bed`, which the pipeline checks before using it. Omit to skip CNV calling. |
+| `cnv_pon` | CNVkit reference `.cnn` built from this project's own normals, by the customer or a separate PoN pipeline. Must come from the same BED as `cnv_targets_bed`. Omit to skip CNV calling. |
 
 ### Fixed in nextflow.config
 
@@ -53,7 +61,7 @@ Per project -- change these when the project changes capture kit or panel:
 
 | Param | Default |
 |---|---|
-| `cnv_targets_bed` | `data/xgen_v2_targets.hg38.cnvkit.bed` (IDT xGen Exome v2, hg38). 4 columns, gene names without exon suffixes. **The PoN must be built from this exact BED.** |
+| `cnv_targets_bed` | `data/xgen_v2_targets.hg38.cnvkit.bed` (IDT xGen Exome v2, hg38). 4 columns, gene names without exon suffixes. **The PoN must be built from this exact BED.** Not passed to sarek -- it records the PoN's provenance and is the BED to build a new PoN against. |
 | `cnv_panel_bed` | `data/ACMG_SF_plus_HemOnc_MANE_exons_50bp.refseq.bed` -- the genes a CNV must hit to reach Tier 1. The gene panel, not the capture kit. |
 | `cnv_panel_name` | `ACMG SF + HemOnc`, the label on the report |
 | `cnv_common_bed` | `null`. Cohort-recurrent CNV regions, if the PoN was delivered with them; left null the recurrent-region filter is not applied. |
