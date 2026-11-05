@@ -300,7 +300,13 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
                 .filter { vcf -> 
                     vcf.name.endsWith('.vcf.gz') && 
                     !vcf.name.contains('.g.vcf.gz') && 
-                    !vcf.name.endsWith('.tbi') 
+                    !vcf.name.endsWith('.tbi') &&
+                    // This glob spans every caller directory, so it also sees
+                    // Manta's structural-variant VCFs. Those carry symbolic
+                    // ALTs (<DEL>, <DUP>) and BND breakends -- a separate
+                    // output, not a small-variant callset -- and must not
+                    // reach the SNV/indel annotation path.
+                    !vcf.name.contains('.manta.') 
                 }
                 .map { vcf -> 
                     def sample = vcf.parent.name
