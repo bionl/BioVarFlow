@@ -4,7 +4,6 @@
   "title": "BioVarFlow parameters",
   "description": "A germline variant-calling workflow with standardized QC, annotation, and per-sample reports.",
   "type": "object",
-
   "$defs": {
     "io_options": {
       "title": "Input / Output",
@@ -26,12 +25,12 @@
           "format": "directory-path"
         },
         "phenotypes": {
-            "type": "string",
-            "title": "Phenotypes CSV (Exomiser)",
-            "description": "CSV of HPO terms per sample, used by Exomiser to rank variants genome-wide. Columns: sample,sex,hpo - sex is MALE / FEMALE / UNKNOWN_SEX, hpo is a semicolon-separated list of HPO IDs (e.g. IQMM,MALE,HP:0004808;HP:0002863). Exomiser is skipped for any sample not listed.",
-            "mimetype": "text/csv",
-            "format": "file-path",
-            "pattern": "^\\S*\\.csv$"
+          "type": "string",
+          "title": "Phenotypes CSV (Exomiser)",
+          "description": "CSV of HPO terms per sample, used by Exomiser to rank variants genome-wide. Columns: sample,sex,hpo - sex is MALE / FEMALE / UNKNOWN_SEX, hpo is a semicolon-separated list of HPO IDs (e.g. IQMM,MALE,HP:0004808;HP:0002863). Exomiser is skipped for any sample not listed.",
+          "mimetype": "text/csv",
+          "format": "file-path",
+          "pattern": "^\\S*\\.csv$"
         },
         "run_id": {
           "type": "string",
@@ -39,13 +38,33 @@
           "description": "Identifier for this pipeline run. Written into the first column of ${outdir}/manifest/run_output_manifest.tsv. If omitted, Nextflow's auto-generated workflow.runName is used."
         }
       }
+    },
+    "cnv_options": {
+      "title": "CNV calling",
+      "type": "object",
+      "fa_icon": "fas fa-chart-area",
+      "description": "CNV calling runs as part of the standard germline pipeline. The only input it needs is this project's panel of normals; the capture kit BED, gene panel and annotation resources are fixed in nextflow.config. Without a panel of normals, CNV calling is skipped and the rest of the run is unaffected. See docs/cnv.md.",
+      "properties": {
+        "cnv_pon": {
+          "type": "string",
+          "title": "Panel of normals (CNVkit reference .cnn)",
+          "description": "CNVkit reference built from this project's own normals, delivered by the customer or a separate PoN pipeline. It must be built from the same capture kit BED the project runs on, which the pipeline checks before using it. Leave empty to skip CNV calling.",
+          "format": "file-path",
+          "pattern": "^\\S*\\.cnn$"
+        }
+      }
     }
   },
-
   "allOf": [
-    { "$ref": "#/$defs/io_options" }
+    {
+      "$ref": "#/$defs/io_options"
+    },
+    {
+      "$ref": "#/$defs/cnv_options"
+    }
   ],
-
-  "required": ["outdir"],
+  "required": [
+    "outdir"
+  ],
   "additionalProperties": true
 }

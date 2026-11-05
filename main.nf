@@ -25,6 +25,9 @@ include { DB_QC_EXPORT } \
 include { MANIFEST } \
   from './modules/manifest.nf'
 
+include { CNV_CALLING } \
+  from './modules/cnv.nf'
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PARAMETERS & VALIDATION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -211,6 +214,23 @@ workflow COLLECT_VARIANT_CALLING_OUTPUTS {
             }
             .map { dist -> tuple(dist.parent.name, dist) }
 
+        // CNVkit coverage. Only the two .cnn files are taken: sarek's own .cnr
+        // and .cns are rebuilt in CNVKIT_POSTPROCESS against the real PoN (see
+        // modules/cnv.nf). checkIfExists stays false even locally -- the glob is
+        // empty whenever cnvkit is not in --tools, which is not an error.
+        cnv_coverage_ch = trigger
+            .flatMap {
+                file("${outdir}/variant_calling/cnvkit/*/*.targetcoverage.cnn", checkIfExists: false)
+            }
+            .map { target ->
+                def sample = target.parent.name
+                def anti   = file("${target.parent}/${target.name.replace('.targetcoverage.cnn', '.antitargetcoverage.cnn')}")
+                if (!isGCS && !anti.exists()) {
+                    error "❌ No antitargetcoverage.cnn beside ${target}. CNVkit's `fix` needs both."
+                }
+                tuple(sample, target, anti)
+            }
+
     emit:
         dv_vcf           = dv_vcf_ch
         hc_vcf           = hc_vcf_ch
@@ -218,6 +238,7 @@ workflow COLLECT_VARIANT_CALLING_OUTPUTS {
         alignment_qc     = alignment_qc_ch       // tuple(sample, file, type)
         mosdepth_summary = mosdepth_summary_ch
         mosdepth_dist    = mosdepth_dist_ch
+        cnv_coverage     = cnv_coverage_ch       // tuple(sample, target.cnn, antitarget.cnn)
 }
 
 workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
@@ -455,6 +476,51 @@ workflow RUN_FULL_VARIANT_CALLING {
             NFCORE_SAREK.out.multiqc_report,
             params.outdir
         )
+
+        // ── CNV calling ──────────────────────────────────────────────────────
+        // Independent of the SNV branches: it consumes sarek's CNVkit coverage
+        // and emits its own report, so it runs in germline and somatic mode
+        // alike and nothing downstream waits on it.
+        if (params.tools && params.tools.split(',').contains('cnvkit')) {
+            // CNVkit needs female/male, which only the samplesheet has
+            // reliably: with --intervals the antitarget bins are empty and
+            // cnvkit's own sex guess gets weak. Carried as a channel and joined
+            // onto the coverage files, not looked up in a map -- the assayMap
+            // above is filled by a subscribe and is not guaranteed populated
+            // when this runs.
+            cnv_sex_ch = PIPELINE_INITIALISATION.out.samplesheet
+                .map { row ->
+                    def meta = row[0]
+                    def sx = [XX: 'female', XY: 'male'][meta.sex?.toString()?.toUpperCase()]
+                    if (!sx) {
+                        error "❌ CNV calling needs the sex of ${meta.sample} in the samplesheet " +
+                              "(got '${meta.sex}'). Set it to XX or XY, or drop cnvkit from --tools."
+                    }
+                    tuple(meta.sample.toString(), sx)
+                }
+                .unique()
+
+            // One sex table for the whole run, for the filter's expected-log2 logic.
+            cnv_sex_tsv_ch = cnv_sex_ch
+                .map { sample, sx -> "${sample}\t${sx}" }
+                .collectFile(name: 'cnv_sex.tsv', newLine: true, sort: true)
+
+            cnv_coverage_meta_ch = COLLECT_VARIANT_CALLING_OUTPUTS.out.cnv_coverage
+                .map { sample, target, anti -> tuple(sample, target, anti) }
+                .join(cnv_sex_ch)
+                .map { sample, target, anti, sx ->
+                    tuple([ sample: sample, assay: assayMap.get(sample, 'NA'),
+                            sex: sx == 'female' ? 'XX' : 'XY' ], target, anti)
+                }
+
+            // CNVs are scored against the same reportable-gene exon BED the SNV
+            // side uses unless --cnv_panel_bed overrides it. Deliberately not
+            // --cnv_targets_bed, which is the whole capture kit.
+            cnv_panel_bed_ch = Channel.value(
+                file(params.cnv_panel_bed ?: params.bed, checkIfExists: true))
+
+            CNV_CALLING(cnv_coverage_meta_ch, cnv_sex_tsv_ch, cnv_panel_bed_ch)
+        }
 
         // Only the consensus branch produces one; declared up front so the
         // somatic and DV-only branches leave a defined value.
