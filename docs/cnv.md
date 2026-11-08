@@ -94,9 +94,14 @@ Shared by every hg38 project, alongside the VEP references:
 | `cnv_segdup` | `gs://vep-data-vaic/cnv/genomicSuperDups.txt.gz` |
 
 **Sample sex is mandatory.** The samplesheet's `sex` column must be `XX` or
-`XY` for every sample; `NA` stops the run. With `--intervals` the antitarget
-bins are empty, so CNVkit cannot guess sex reliably, and a wrong guess makes a
-normal male chrX read as cn = 0.
+`XY` for every sample; `NA` stops the run. CNVkit's own guess leans on the
+antitarget bins, and whether those carry any signal depends on the capture and
+on how the CRAM was made -- it is not guaranteed. On KHCC's coverage it is
+exactly zero (`antitarget_frac_with_reads` is 0.000 for all 32 samples in
+`cnv_normal`'s `qc/coverage_check.tsv`), so there is nothing to guess from. A
+wrong sex makes a normal male chrX read as cn = 0, so it is taken from the
+samplesheet rather than inferred. `CNVKIT_POSTPROCESS` still records CNVkit's
+guess in the QC row, and `CNV_QC_SUMMARY` warns when the two disagree.
 
 All thresholds are params (`cnv_max_bivar`, `cnv_min_exons`, `cnv_del_log2`, ...)
 with the validated defaults. Change them in the config per project rather than
@@ -144,13 +149,19 @@ Sarek ships 0.9.10.
 2. `cnvkit.py sex` on the target coverage — recorded for the QC table, not used
    for calling.
 3. `cnvkit.py fix` from sarek's `*.targetcoverage.cnn` / `*.antitargetcoverage.cnn`
-   against the PoN. **Sarek's own `.cnr` is not used:** with `--intervals` the
-   recalibrated CRAMs keep only on-target reads, so every antitarget bin reads
-   zero and sarek's `.cnr` carries ~12k fake "neutral" bins. `fix` against a
-   real PoN drops them.
+   against the PoN. **Sarek's own `.cnr` is not used,** because its `.cns` and
+   calls come from `cnvkit batch`'s defaults rather than the segmentation in
+   step 4, and re-running `fix` against the project PoN is what makes the
+   `.cnr` comparable to that PoN. A side effect on PoNs whose antitargets are
+   empty (KHCC's): `fix` drops every antitarget bin, rather than carrying ~14k
+   zero-coverage bins through as "neutral". See Known limits.
 4. `cnvkit.py segment -m cbs -t 0.001 --smooth-cbs --drop-low-coverage`.
    `cnvkit batch` exposes none of these, and its defaults missed a 3-exon
    deletion and merged a 5 Mb mosaic gain into a whole arm.
+   Note what `--drop-low-coverage` costs: it removes 0-read bins *before*
+   segmentation, so a homozygous deletion never reaches a segment at all. That
+   is why `CNV_FILTER` scans the `.cnr` separately for them (see its rules
+   table).
 5. `cnvkit.py call --sample-sex <from samplesheet> --center median`, with `-y`
    only when `cnv_pon_haploid_x` is set.
 6. `cnvkit.py metrics` and `scatter`.
@@ -171,6 +182,7 @@ dropped silently — each call keeps the reasons it passed or failed.
 | 1 Sample QC | bivar | ≤ 0.25 |
 | | PoN size | < 10 normals → low-confidence flag |
 | 2 Technical | Exons in call | ≥ 3 |
+| | *Homozygous deletions are exempt from level 2* | 0 reads is its own evidence |
 | | Germline signal vs expected level | DEL ≤ −0.4, DUP ≥ +0.3 |
 | | Mosaic route | ≥ 50 exons and \|Δlog2\| ≥ 0.2; not on haploid X/Y |
 | | Segment depth | ≥ 20× |
@@ -180,6 +192,23 @@ dropped silently — each call keeps the reasons it passed or failed.
 | | Segmental duplication | > 50% → flag only |
 | 4 Relevance | Panel gene overlap | required for Tier 1 |
 | | ClinGen | DEL hitting HI=3 / DUP hitting TS=3 → annotated |
+
+Plus a separate scan for events level 2 can never see:
+
+| Homozygous deletion | Rule | Default |
+|---|---|---|
+| Detection | consecutive `.cnr` target bins at log2 below the expected level | ≥ 2 bins, log2 < −3 |
+| Confirmation | other samples with normal coverage (log2 > −1) at those bins | ≥ 50% of them |
+| Small runs | below this many other samples, the cohort check is skipped and the PoN alone is trusted | < 5 |
+| Frequency | gnomAD-SV **AF²** (the homozygous genotype frequency), matched by containment rather than reciprocal overlap | AF² > 0.01 → common |
+| Recurrence | samples in the run homozygous at the same place | ≥ 3 → recurrent |
+
+Containment, not reciprocal overlap, because an exon-bounded call is shorter
+than the real event. The `HOMDEL` rows in `cnv_common_bed` matter most in
+single-sample runs, where the in-run recurrence test cannot fire: measured on
+XZJR alone, dropping them let a `GPAT2` hom-del escape to Tier 2, because its
+gnomAD-SV AF of 0.0052 is under the `cnv_max_af` ceiling. `CFHR3`/`CFHR1` stay
+Tier 3 either way at AF 0.2293.
 
 Tiers: **Tier 1** passes 1–3, hits a panel gene, not in a segdup. **Tier 2**
 passes 1–3 but has no panel gene, or sits in a segdup. **Tier 3** filtered, with
@@ -316,12 +345,34 @@ self-normalised. IRIC is the exception — `manifest.json` records
   PoN is below the size threshold). The tier counts in
   [cnv_validation.md](cnv_validation.md) are a method check, not a clinical
   validation; that needs a cohort that is not also the PoN.
+- **CBS misses some short events that have a clear signal.** About 25 against
+  3billion on KHCC, mostly 3-6 exon duplications; XDMT's `PADI3` DUP, 10 exons
+  at +0.57, was left inside one 121 Mb neutral segment. Lowering `-t` to 0.01 or
+  0.0001, and dropping `--smooth-cbs`, do not help. `hmm-germline` was tested on
+  all 32 samples and **rejected**: it found 35 of the 67 clear-signal events
+  against CBS's 42, lost the validated IQMM `RLBP1` deletion, found 44 of IRIC's
+  52 against CBS's 50, and doubled Tier 2 (224 calls against 117). Running both
+  methods adds 3 events. This is a known limit, not a TODO.
+- **The homozygous-deletion scan depends on the PoN.** A gene with no coverage
+  in the PoN cannot be called, because `cnvkit fix` drops bins the PoN does not
+  cover before the scan ever sees them.
 - **Report integration not done.** Tier 1 and Tier 2 CNVs are not yet in the
   sample report; they belong in their own CNV section, not mixed with SNV ACMG
   classes.
 - **Manta SV filtering not built.** Manta runs with `--exome` under `--wes`, but
   filtering SVs against the panel needs whole gene spans, not the exon BED.
 - **TIDDIT** does not fit exome data; keep it out of `--tools`.
-- **Off-target reads:** computing coverage from the markduplicates CRAM
-  (pre-BQSR) might bring back off-target reads and give the antitarget bins real
-  signal. Untested.
+- **Off-target reads are not used, and that is not caused by `--intervals`.**
+  Whether the antitarget bins carry signal depends on the capture and on how the
+  CRAM was made. `params.intervals` never restricted this pipeline's CRAMs: the
+  only sarek step that subsets reads by intervals is ApplyBQSR
+  (`external/sarek/modules/nf-core/gatk4/applybqsr/main.nf`), and
+  `skip_tools = "baserecalibrator"` means it never runs. So removing
+  `params.intervals` changed nothing here.
+
+  On KHCC's coverage the antitargets are simply empty --
+  `antitarget_frac_with_reads` is 0.000 for all 32 samples in `cnv_normal`'s
+  `qc/coverage_check.tsv` -- so `fix` drops all ~14k antitarget bins and calling
+  is target-only. That is harmless, not a defect. The off-target signal is only
+  usable when both the PoN's normals and the patient have it; check
+  `coverage_check.tsv` for a new capture before assuming either way.

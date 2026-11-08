@@ -12,12 +12,17 @@
 //                       Excel workbook
 //
 // Why not sarek's own .cnr/.cns (validated in docs/cnv_validation.md):
-//   * with --intervals the recalibrated CRAMs keep only on-target reads, so
-//     every antitarget bin has zero coverage and sarek's .cnr carries ~12k
-//     fake "neutral" bins. `fix` against a real PoN drops them.
 //   * `cnvkit batch` does not expose -m cbs -t 0.001 --smooth-cbs
 //     --drop-low-coverage, and its defaults miss small deletions and merge
-//     mosaic gains into whole arms.
+//     mosaic gains into whole arms. Its .cns and calls are therefore not the
+//     ones we want, and re-running `fix` is what makes the .cnr comparable to
+//     the project PoN.
+//   * On a PoN whose antitargets are empty -- KHCC's, where
+//     antitarget_frac_with_reads is 0.000 for every sample -- `fix` also drops
+//     all ~14k antitarget bins instead of carrying them as "neutral". That is
+//     a property of the capture and the CRAM, NOT of --intervals: the only
+//     sarek step that subsets reads by intervals is ApplyBQSR, which never
+//     runs here because of skip_tools = baserecalibrator.
 // ═══════════════════════════════════════════════════════════════════════════
 
 params.scriptdir = params.scriptdir ?: "${workflow.projectDir}/scripts"

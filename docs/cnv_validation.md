@@ -1,7 +1,11 @@
 # CNV post-processing — validation on the KHCC test data
 
-Validates steps 2–3 of `CNV_postprocessing_agent_prompt.md` after porting
-`filter_cnv.py` into `scripts/`. No Nextflow wiring yet.
+Validates the CNVkit post-processing method on the KHCC test data. The pipeline
+wiring that followed is described in [cnv.md](cnv.md); this file is the evidence
+behind its defaults.
+
+**Read the caveat in "What this does and does not validate" before quoting any
+number here.**
 
 ## What was run
 
@@ -22,8 +26,17 @@ Then `filter_cnv.py` over all three `.call.cns` with the ACMG SF + HemOnc panel 
 gnomAD-SV v4.1, gnomAD exome CNV, ClinGen, UCSC segdups and `new_run/common_cnv.bed`.
 
 `fix` keeps 189,674 of 197,769 target bins and **0 of 14,421 antitarget bins** for all three
-samples — rule 4's prediction, and the reason sarek's own `.cnr` must not be used. The
-"most bins have no or very low coverage" warning comes from the empty antitargets and is expected.
+samples. `cnv_normal`'s `qc/coverage_check.tsv` puts this on the whole cohort:
+`antitarget_frac_with_reads` is 0.000 for all 32 samples, so the antitargets of
+this capture carry no signal at all and `fix` correctly drops them. The "most
+bins have no or very low coverage" warning comes from that and is expected.
+
+This is a property of the capture and of how the CRAMs were made, **not** of
+`--intervals`: the only sarek step that subsets reads by intervals is ApplyBQSR,
+which never runs in BioVarFlow (`skip_tools = "baserecalibrator"`). Earlier
+versions of these docs blamed `--intervals`; that was wrong. The reason to
+re-run `fix` and `segment` instead of using sarek's `.cnr`/`.cns` is the
+segmentation settings, not the antitargets.
 
 ## Level 1 — sample QC
 
@@ -63,18 +76,103 @@ Males ≈ −1, female ≈ 0, autosomes centred: the PoN is correctly female-nor
 
 The mosaic route fired as intended on IRIC: estimated cell fractions 31–46%, in the
 35–50% range the prototype reported. The 7q and 21 arms are split across more segments than the
-leave-one-out prototype, which is expected — IQMM, IRIC and EYTA are all *inside* `pon_final.A.cnn`,
-so their own signal partly normalises itself away and shifts breakpoints. Every panel gene and
-every tier assignment still lands where the prototype put it.
+leave-one-out prototype, which is expected: **IQMM and EYTA are inside**
+`pon_final.A.cnn`, so their own signal partly normalises itself away and shifts
+breakpoints. IRIC is **not** in the PoN — `manifest.json` records
+`"excluded": ["IRIC"]` — so its breakpoint spread is segmentation, not
+self-normalisation. Every panel gene and every tier assignment still lands where
+the prototype put it.
 
 ## Change to the ported script
 
-`scripts/filter_cnv.py` is the prototype unchanged except for `--haploid-x-reference`
-(rule 5 / step 3 of the prompt): with a PoN built with `-y`, `expected()` now puts a normal
-male chrX at log2 0 and a female at +1, instead of −1 and 0.
+`scripts/filter_cnv.py` is the prototype with two BioVarFlow-local changes, both
+tagged `# BioVarFlow-local` so a re-port stays mechanical:
 
-## Not yet done
+1. `--haploid-x-reference`: with a PoN built with `-y`, `expected()` puts a
+   normal male chrX at log2 0 and a female at +1, instead of −1 and 0.
+2. `--provenance`: appends `CNV_MANIFEST_CHECK`'s `cnv_pon_provenance.tsv` to the
+   workbook's Thresholds sheet, so a delivered report records which normals
+   produced it.
 
-Nextflow wiring: params, sarek `--wes --intervals --cnvkit_reference`, the
-`CNVKIT_POSTPROCESS` and `CNV_FILTER` processes, the PoN-compatibility fail-fast check,
-and report integration (step 4, "ask first").
+Everything else is the prototype verbatim. Re-running the prototype's own
+command through the ported script reproduces its numbers exactly: 32 samples,
+1517 calls, Tier 1 6, Tier 2 113, Tier 3 1398.
+
+## Comparison with 3billion's reports, all samples
+
+Our CNVkit calls were compared with 3billion's CNV reports for 31 KHCC samples
+(`compare_3billion.py` in the prototype; reports in `3billion/cnv_reports/`).
+
+| 3billion depth calls (their caller, 3bCNV) | n | found by us, any tier |
+|---|---|---|
+| IRIC (mosaic sample), all calls | 52 | 50 |
+| Other 29: clear signal in our data (≥ 3 exons, \|log2\| ≥ 0.3 DUP / 0.4 DEL) | 67 | 42 |
+| Other 29: homozygous CFHR3/CFHR1 deletion | 22 | **0 before the hom-del scan, 22 after** |
+| Other 29: weak or no signal in our data | 40 | 2 |
+| Other 29: < 3 exons, or not in the capture | 14 | 1 |
+| 3billion **Manta** calls (sub-exon SVs, mostly intronic) | 42 | 1 — out of scope for CNVkit |
+
+Per reported event: IQMM 2 of 4 (`RLBP1` and `LRRC56` found; `PRSS2` and
+`CNNM2`/`NT5C2` have weak signal in our data), IRIC 5 of 5 mosaic events, and
+EYTA's chr2:85.54–85.87 Mb DUP is in their report too.
+
+Going the other way, 42 of our 118 Tier 1/Tier 2 calls in samples that have a
+3billion report also appear in it. Many of the rest sit in segmental
+duplications or are small events already flagged "confirm". One recurring set of
+DUPs (chr2:95.5 Mb, chr3:130.6 Mb, chr4:69.9–70.6 Mb) appears only in XZJR,
+NIOZ, YIOO and IRIC — the samples sequenced between the two technical batches —
+so it is probably technical.
+
+## Homozygous deletions
+
+`segment --drop-low-coverage` removes 0-read bins before segmentation, so a
+2-copy loss never reaches a segment. CFHR3/CFHR1 sit at log2 ≈ −27 and were
+missed in all 7 samples carrying them: 0 of 3billion's 22 calls. The `.cnr` scan
+in `CNV_FILTER` recovers them.
+
+- 90 homozygous deletions across the 32 samples, 86 in Tier 3 and 4 in Tier 2.
+- CFHR3/CFHR1 found in all 7 samples 3billion reported it in (DVFZ, EXGT, KAXU,
+  NYOM, WZIU, XZJR, YIOO) — 22 of 22 of their calls.
+- Almost all 90 are known common polymorphisms: `LCE3B`/`LCE3C`, `UGT2B17`,
+  `ANKRD36`/`ANKRD36B`, `CFHR3`/`CFHR1`, `GBP3`, `USP17L`, `BTNL3`/`BTNL8`.
+- Tier counts over 32 samples went from T1 6 / T2 109 / T3 1312 to
+  **T1 6 / T2 113 / T3 1398**. All non-hom-del calls are unchanged.
+- Single-sample mode: XZJR alone still reports the `CFHR3`, `CFHR1`,
+  `LCE3B`/`LCE3C` and `GBP3` hom-dels in Tier 3, so the fallback to the PoN
+  works when the in-run cohort check cannot.
+
+## Segmentation methods tested
+
+CBS at `-t 0.001 --smooth-cbs` is the choice. It still misses about 25 short
+events that have a clear signal, mostly 3–6 exon duplications — XDMT's `PADI3`
+DUP, 10 exons at +0.57, was left inside one 121 Mb neutral segment. Lowering
+`-t` to 0.01 or 0.0001, and dropping `--smooth-cbs`, do not help.
+
+`hmm-germline` was tested on all 32 samples and **rejected**:
+
+| | CBS | hmm-germline |
+|---|---|---|
+| of the 67 clear-signal 3billion events | 42 | 35 |
+| of IRIC's 52 events | 50 | 44 |
+| IQMM `RLBP1` deletion (validated) | found | **lost** |
+| Tier 2 calls | 117 | 224 |
+
+Running both methods and merging adds 3 events. Not worth doubling Tier 2.
+
+## What this does and does not validate
+
+This is a **method check, not a clinical validation.**
+
+- **27 of the 32 samples are inside `pon.A.cnn`.** A sample in its own PoN
+  partly normalises its own CNVs away, so its numbers here are optimistic about
+  breakpoints and pessimistic about amplitude. The prototype's leave-one-out
+  numbers are the clean ones.
+- The samples that are genuinely independent of PoN A are **IRIC** (excluded
+  from it) and the four batch-B samples (FBWA, SZRM, TIAM, XDMT) — whose own
+  `pon.B.cnn` has 4 normals, below `cnv_min_pon_size`, so their calls carry the
+  low-confidence flag.
+- So there is no clean end-to-end run on this cohort at all. A real validation
+  needs a cohort that is not also the PoN.
+- The three-sample run at the top of this file was done before the Nextflow
+  wiring and before the hom-del scan; its tier counts (161 calls, T1 6 / T2 24 /
+  T3 131) describe that run, not the current pipeline.
