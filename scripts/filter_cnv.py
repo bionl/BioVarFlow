@@ -62,6 +62,9 @@ ap.add_argument("--recip", type=float, default=0.5)
 ap.add_argument("--small-exons", type=int, default=5, help="calls with <= this many exons need orthogonal confirmation")
 ap.add_argument("--haploid-x-reference", action="store_true",
                 help="the PoN was built with -y (male/haploid-X reference); expected chrX log2 flips")
+# BioVarFlow-local: provenance from CNV_MANIFEST_CHECK, recorded in the report.
+ap.add_argument("--provenance", default=None,
+                help="two-column TSV from cnv_manifest_check.py; appended to the Thresholds sheet")
 # Homozygous deletions: 0-read bins are removed by 'segment --drop-low-coverage', so they are never segmented.
 # They are recovered here from the .cnr: runs of target bins far below expected that are covered in most other samples.
 ap.add_argument("--cnr", nargs="+", default=None, help="CNVkit .cnr files (globs); default: <S>.cnr next to <S>.call.cns")
@@ -516,6 +519,17 @@ ws.append(["Panel", f"{a.panel_name}: {a.panel_bed}"])
 ws.append(["Annotations", f"gnomAD SV: {a.gnomad_sv}; gnomAD exome CNV: {a.gnomad_exome_cnv}; ClinGen: {a.clingen}; segdups: {a.segdup}; cohort common CNVs: {a.common_bed}"])
 for b, p in pons.items():
     ws.append([f"PoN {b}", f"{p} ({batch_n.get(b, '?')} normals)"])
+# BioVarFlow-local: what the PoN was built from, so a delivered report is self-describing.
+if a.provenance and os.path.exists(a.provenance):
+    ws.append([])
+    ws.append(["PoN provenance", "from manifest.json; see docs/cnv.md"])
+    with open(a.provenance) as fh:
+        for i, line in enumerate(fh):
+            parts = line.rstrip("\n").split("\t")
+            if i == 0 and parts[:1] == ["key"]:
+                continue
+            if len(parts) >= 2:
+                ws.append([parts[0], parts[1]])
 ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 22, 100
 wb.save(a.out_xlsx)
 

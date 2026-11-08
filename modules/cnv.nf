@@ -100,6 +100,41 @@ process CNVKIT_POSTPROCESS {
     """
 }
 
+process CNV_MANIFEST_CHECK {
+    label 'process_low'
+
+    publishDir "${params.outdir}/cnv", mode: 'copy'
+
+    input:
+    path pon
+    path targets_bed
+    path common_bed
+    path manifest
+    path check_script
+
+    output:
+    path "cnv_pon_provenance.tsv", emit: provenance
+
+    script:
+    // Optional inputs arrive as the NO_FILE placeholder. A missing manifest is a
+    // warning inside the script, not a reason to skip the process: the run should
+    // still record in the report that the PoN's provenance was never verified.
+    def manifest_arg = manifest.name   == 'NO_FILE' ? '' : "--manifest ${manifest}"
+    def common_arg   = common_bed.name == 'NO_FILE' ? '' : "--common-bed ${common_bed}"
+    def haploid_arg  = params.cnv_pon_haploid_x ? '--haploid-x-reference' : ''
+    """
+    python3 ${check_script} \\
+        --pon ${pon} \\
+        --targets-bed ${targets_bed} \\
+        ${manifest_arg} \\
+        ${common_arg} \\
+        ${haploid_arg} \\
+        --cnvkit-version ${params.cnv_cnvkit_version} \\
+        --min-pon-size ${params.cnv_min_pon_size} \\
+        --out cnv_pon_provenance.tsv
+    """
+}
+
 process CNV_FILTER {
     label 'process_low'
 
@@ -118,6 +153,7 @@ process CNV_FILTER {
     path segdup
     path gnomad_exome_cnv
     path common_bed
+    path provenance      // cnv_pon_provenance.tsv, for the report's Thresholds sheet
 
     output:
     path "cnv_filtered_all.tsv", emit: all_calls
@@ -164,6 +200,7 @@ process CNV_FILTER {
         --homdel-min-bins ${params.cnv_homdel_min_bins} \\
         --homdel-cohort-frac ${params.cnv_homdel_cohort_frac} \\
         --homdel-min-cohort ${params.cnv_homdel_min_cohort} \\
+        --provenance ${provenance} \\
         --small-exons ${params.cnv_small_exons} \\
         --outdir . \\
         --out-xlsx cnv_report.xlsx
@@ -236,6 +273,26 @@ workflow CNV_CALLING {
 
         def noFile = file("${workflow.projectDir}/assets/NO_FILE", checkIfExists: true)
 
+        // manifest.json ships beside the .cnn, so default to that unless told
+        // otherwise. file().parent keeps this working for gs:// paths too.
+        def manifestPath = params.cnv_pon_manifest ?: "${file(params.cnv_pon).parent}/manifest.json"
+        def manifestFile = file(manifestPath)
+        if (params.cnv_pon_manifest && !manifestFile.exists()) {
+            error "❌ --cnv_pon_manifest was given as ${params.cnv_pon_manifest} but that file " +
+                  "does not exist. Omit it to look for manifest.json next to --cnv_pon, or fix the path."
+        }
+
+        common_bed_ch = Channel.value(
+            params.cnv_common_bed ? file(params.cnv_common_bed, checkIfExists: true) : noFile)
+
+        CNV_MANIFEST_CHECK(
+            pon_ch,
+            Channel.value(file(params.cnv_targets_bed, checkIfExists: true)),
+            common_bed_ch,
+            Channel.value(manifestFile.exists() ? manifestFile : noFile),
+            Channel.value(file("${params.scriptdir}/cnv_manifest_check.py", checkIfExists: true))
+        )
+
         CNV_FILTER(
             CNVKIT_POSTPROCESS.out.calls.map   { _meta, cns -> cns }.collect(),
             CNVKIT_POSTPROCESS.out.metrics.map { _meta, m   -> m   }.collect(),
@@ -248,7 +305,8 @@ workflow CNV_CALLING {
             Channel.value(file(params.cnv_clingen,   checkIfExists: true)),
             Channel.value(file(params.cnv_segdup,    checkIfExists: true)),
             Channel.value(params.cnv_gnomad_exome_cnv ? file(params.cnv_gnomad_exome_cnv, checkIfExists: true) : noFile),
-            Channel.value(params.cnv_common_bed       ? file(params.cnv_common_bed,       checkIfExists: true) : noFile)
+            common_bed_ch,
+            CNV_MANIFEST_CHECK.out.provenance
         )
 
         CNV_QC_SUMMARY(CNVKIT_POSTPROCESS.out.qc.map { _meta, qc -> qc }.collect())
@@ -258,4 +316,5 @@ workflow CNV_CALLING {
         filtered = CNV_FILTER.out.all_calls
         xlsx     = CNV_FILTER.out.xlsx
         qc       = CNV_QC_SUMMARY.out.summary
+        provenance = CNV_MANIFEST_CHECK.out.provenance
 }

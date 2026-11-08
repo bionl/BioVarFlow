@@ -58,6 +58,13 @@
           "description": "The common_cnv.bed that ships with the panel of normals, listing cohort-recurrent CNV regions. Part of the PoN delivery, not an independent input: supply the one built alongside cnv_pon, never a BED from a different PoN. Without it, cohort-recurrent artifacts are not recognised and reach Tier 1 and Tier 2.",
           "format": "file-path",
           "pattern": "^\\S*\\.bed$"
+        },
+        "cnv_pon_manifest": {
+          "type": "string",
+          "title": "PoN manifest (manifest.json)",
+          "description": "The manifest.json from the cnv_normal PoN build. Leave empty to look for manifest.json next to cnv_pon, which is where a PoN delivery puts it. It records the target BED's md5, the cnvkit version, the reference sex model and each PoN's normals; the run stops if the target BED or the sex model disagrees, since either silently corrupts copy numbers.",
+          "format": "file-path",
+          "pattern": "^\\S*\\.json$"
         }
       }
     }
