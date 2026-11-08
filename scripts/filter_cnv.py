@@ -59,9 +59,20 @@ ap.add_argument("--min-depth", type=float, default=20)
 ap.add_argument("--max-spread", type=float, default=0.3)
 ap.add_argument("--max-af", type=float, default=0.01)
 ap.add_argument("--recip", type=float, default=0.5)
+ap.add_argument("--small-exons", type=int, default=5, help="calls with <= this many exons need orthogonal confirmation")
 ap.add_argument("--haploid-x-reference", action="store_true",
                 help="the PoN was built with -y (male/haploid-X reference); expected chrX log2 flips")
-ap.add_argument("--small-exons", type=int, default=5, help="calls with <= this many exons need orthogonal confirmation")
+# Homozygous deletions: 0-read bins are removed by 'segment --drop-low-coverage', so they are never segmented.
+# They are recovered here from the .cnr: runs of target bins far below expected that are covered in most other samples.
+ap.add_argument("--cnr", nargs="+", default=None, help="CNVkit .cnr files (globs); default: <S>.cnr next to <S>.call.cns")
+ap.add_argument("--no-homdel", action="store_true", help="skip the homozygous-deletion scan")
+ap.add_argument("--homdel-log2", type=float, default=-3.0, help="bin log2 (vs expected) below this counts as ~0 copies")
+ap.add_argument("--homdel-min-bins", type=int, default=2)
+ap.add_argument("--homdel-cohort-frac", type=float, default=0.5,
+                help="fraction of the other samples that must have normal coverage (log2 > -1) at the same bins")
+ap.add_argument("--homdel-min-cohort", type=int, default=5,
+                help="with fewer other samples in the run, skip the cohort check and rely on the PoN "
+                     "(cnvkit fix already drops bins the PoN does not cover)")
 a = ap.parse_args()
 R, A = a.run_dir, a.annot
 def pick(val, legacy):
@@ -97,7 +108,15 @@ if not pons:
 if a.calls:
     call_files = sorted({p for g in a.calls for p in glob.glob(g)})
 else:
-    call_files = sorted(glob.glob(f"{R}/*/*.call.cns"))
+    # only <R>/<S>/<S>.call.cns (side folders such as test runs hold other copies)
+    call_files = sorted(f for f in glob.glob(f"{R}/*/*.call.cns")
+                        if os.path.basename(f) == os.path.basename(os.path.dirname(f)) + ".call.cns")
+_seen = {}
+for f in call_files:
+    _seen.setdefault(os.path.basename(f).replace(".call.cns", ""), []).append(f)
+for s_, fs in _seen.items():
+    if len(fs) > 1:
+        ap.error(f"sample {s_} has more than one .call.cns: {fs}")
 outdir = a.outdir or R or "."
 os.makedirs(outdir, exist_ok=True)
 def batch_of(s):
@@ -246,6 +265,87 @@ def expected(chrom, sx):
     return (2, 0.0)
 
 
+def find_cnr(call_path, s):
+    for p in cnr_files:
+        if os.path.basename(p) == f"{s}.cnr":
+            return p
+    for p in (os.path.join(os.path.dirname(call_path), f"{s}.cnr"), f"{R}/{s}/{s}.cnr" if R else ""):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+cnr_files = sorted({p for g in (a.cnr or []) for p in glob.glob(g)})
+cnr_bins, cohort = {}, defaultdict(list)
+if not a.no_homdel:
+    print("Loading .cnr files for the homozygous-deletion scan ...")
+    for f in call_files:
+        s = os.path.basename(f).replace(".call.cns", "")
+        p = find_cnr(f, s)
+        if s not in sex or not p:
+            continue
+        rows = csv.reader(open(p), delimiter="\t")
+        h = next(rows); il, idp, ig = h.index("log2"), h.index("depth"), h.index("gene")
+        d = defaultdict(list)
+        for r in rows:
+            if r[ig] == "Antitarget":
+                continue
+            elg = expected(r[0], sex[s])[1]
+            if elg is None:
+                continue
+            v = float(r[il]) - elg
+            d[r[0]].append((int(r[1]), int(r[2]), v, float(r[idp]), r[ig]))
+            cohort[(r[0], int(r[1]))].append((s, v))
+        for c in d:
+            d[c].sort()
+        cnr_bins[s] = d
+    if not cnr_bins:
+        print("  no .cnr files found: homozygous-deletion scan skipped")
+
+
+def homdels(s, existing):
+    """Runs of >= homdel_min_bins consecutive target bins at ~0 copies that most other samples cover normally."""
+    out = []
+    for c, bins in cnr_bins.get(s, {}).items():
+        run = []
+        for b in bins + [None]:
+            ok = False
+            if b is not None and b[2] < a.homdel_log2:
+                others = [v for (o, v) in cohort[(c, b[0])] if o != s]
+                ok = (len(others) < a.homdel_min_cohort or
+                      sum(v > -1 for v in others) / len(others) >= a.homdel_cohort_frac)
+            if ok:
+                run.append(b); continue
+            if len(run) >= a.homdel_min_bins:
+                st_, en = run[0][0], run[-1][1]
+                if not any(x[0] == c and x[1] < en and x[2] > st_ for x in existing):
+                    genes = ",".join(sorted({x[4] for x in run} - {"-"}))
+                    out.append((c, st_, en, genes, st.median(x[2] for x in run), st.median(x[3] for x in run), len(run)))
+            run = []
+    return out
+
+
+# Pre-pass: homozygous deletions for every sample, so cohort recurrence can be counted among them
+# (common_cnv.bed is built from segments, which never contain 0-read bins).
+hd_calls, hd_index = {}, Index()
+if not a.no_homdel:
+    for f in call_files:
+        s = os.path.basename(f).replace(".call.cns", "")
+        if s not in cnr_bins:
+            continue
+        rr = list(csv.reader(open(f), delimiter="\t"))
+        icn = rr[0].index("cn")
+        hd_calls[s] = homdels(s, [(r[0], int(r[1]), int(r[2])) for r in rr[1:] if r[icn] == "0"])
+        for x in hd_calls[s]:
+            hd_index.add(x[0], x[1], x[2], s)
+    hd_index.build()
+    print(f"  homozygous-deletion candidates: {sum(map(len, hd_calls.values()))} in {len(hd_calls)} samples")
+
+
+def hd_recurrence(s, c, st_, en):
+    return len({v for (hs, he, v) in hd_index.query(c, st_, en) if v != s}) + 1
+
+
 cols = ["sample", "sex", "batch", "tier", "chrom", "start", "end", "size_kb", "type", "cn", "log2", "delta_log2",
         "est_cell_fraction", "exons", "depth", "ref_spread", "panel_genes", "clingen_dosage", "gnomad_sv_max_af",
         "gnomad_exome_cnv_carriers", "cohort_recurrent", "segdup_frac", "flags", "reasons", "all_genes"]
@@ -259,6 +359,14 @@ for f in call_files:
     bivar = metrics.get(s, float("nan"))
     rows = list(csv.reader(open(f), delimiter="\t"))
     ix = {k: i for i, k in enumerate(rows[0])}
+    hd_keys = set()
+    if not a.no_homdel:
+        for (c, st_, en, g, v, dp, n) in hd_calls.get(s, []):
+            r = [""] * len(rows[0])
+            r[0], r[1], r[2] = c, str(st_), str(en)
+            r[ix["gene"]], r[ix["log2"]], r[ix["cn"]] = g or "-", str(v + expected(c, sx)[1]), "0"
+            r[ix["depth"]], r[ix["probes"]] = str(dp), str(n)
+            rows.append(r); hd_keys.add((c, st_, en))
     res = []
     for r in rows[1:]:
         c, st_, en = r[0], int(r[1]), int(r[2])
@@ -266,12 +374,15 @@ for f in call_files:
         ecn, elg = expected(c, sx)
         if elg is None or cn == ecn:
             continue
+        hd = (c, st_, en) in hd_keys
         t = "DEL" if cn < ecn else "DUP"
         d = lg - elg
         base = 2 if c not in ("chrX", "chrY") or (c == "chrX" and sx == "female") else 1
         ratio = 2 ** d
         cf = min(1.0, abs(ratio - 1) * base)  # one-copy change in a fraction of cells
         reasons, flags = [], []
+        if hd:
+            flags.append("homozygous deletion (0 reads; from .cnr scan)")
         # level 1
         if bivar > a.max_bivar:
             reasons.append(f"sample noisy (bivar {bivar:.2f})")
@@ -280,26 +391,33 @@ for f in call_files:
         # level 2
         germ = (t == "DEL" and d <= a.del_log2) or (t == "DUP" and d >= a.dup_log2)
         mos = base == 2 and n >= a.mosaic_probes and abs(d) >= a.mosaic_log2
-        if n < a.min_probes:
-            reasons.append(f"<{a.min_probes} exons")
-        elif not (germ or mos):
-            reasons.append(f"weak signal (delta log2 {d:+.2f})")
-        if mos and not germ:
-            flags.append(f"mosaic-level (~{cf:.0%} of cells)")
-        if dp < a.min_depth:
-            reasons.append(f"low depth ({dp:.0f}x)")
         sp = [x[2] for x in spread[b].query(c, st_, en)]
         msp = st.median(sp) if sp else float("nan")
-        if sp and msp >= a.max_spread:
-            reasons.append(f"noisy region (ref spread {msp:.2f})")
+        if not hd:  # a 0-read run is its own evidence; depth/spread/exon-count rules are for partial losses/gains
+            if n < a.min_probes:
+                reasons.append(f"<{a.min_probes} exons")
+            elif not (germ or mos):
+                reasons.append(f"weak signal (delta log2 {d:+.2f})")
+            if mos and not germ:
+                flags.append(f"mosaic-level (~{cf:.0%} of cells)")
+            if dp < a.min_depth:
+                reasons.append(f"low depth ({dp:.0f}x)")
+            if sp and msp >= a.max_spread:
+                reasons.append(f"noisy region (ref spread {msp:.2f})")
         # level 3
         com = common.query(c, st_, en)
         cfrac = covered_fraction(com, st_, en) if com else 0
-        if cfrac >= 0.5:
-            reasons.append("recurrent in cohort")
+        n_hd = hd_recurrence(s, c, st_, en) if hd else 0
+        if cfrac >= 0.5 or n_hd >= 3:
+            reasons.append("recurrent in cohort" + (f" ({n_hd} samples homozygous)" if n_hd >= 3 else ""))
+        # an exon-bounded homozygous call is shorter than the true event, so match gnomAD by containment
         g_af = max([v[1] for (gs, ge, v) in gsv.query(c, st_, en)
-                    if v[0] in (t, "CNV") and recip(st_, en, gs, ge, a.recip)], default=0.0)
-        if g_af > a.max_af:
+                    if v[0] in (t, "CNV") and (covered_fraction([(gs, ge)], st_, en) >= a.recip if hd
+                                               else recip(st_, en, gs, ge, a.recip))], default=0.0)
+        if hd and base == 2:  # homozygous genotype frequency ~ AF^2
+            if g_af ** 2 > a.max_af:
+                reasons.append(f"common in gnomAD-SV (AF {g_af:.3f}; homozygous ~{g_af ** 2:.3f})")
+        elif g_af > a.max_af:
             reasons.append(f"common in gnomAD-SV (AF {g_af:.3f})")
         g_ex = max([v[1] for (gs, ge, v) in gex.query(c, st_, en)
                     if v[0] == t and recip(st_, en, gs, ge, a.recip)], default=0)

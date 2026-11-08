@@ -108,6 +108,7 @@ process CNV_FILTER {
     input:
     path calls, stageAs: 'calls/*'       // every sample's *.call.cns
     path metrics, stageAs: 'metrics/*'   // every sample's *.metrics.tsv
+    path cnrs, stageAs: 'cnr/*'          // every sample's *.cnr, for the hom-del scan
     path sex_tsv
     path filter_script
     path pon
@@ -137,6 +138,7 @@ process CNV_FILTER {
 
     python3 ${filter_script} \\
         --calls calls/*.call.cns \\
+        --cnr cnr/*.cnr \\
         --sex ${sex_tsv} \\
         --pon ${pon} ${pon_size_arg} ${haploid_arg} \\
         --panel-bed ${panel_bed} \\
@@ -158,6 +160,10 @@ process CNV_FILTER {
         --max-spread ${params.cnv_max_spread} \\
         --max-af ${params.cnv_max_af} \\
         --recip ${params.cnv_recip_overlap} \\
+        --homdel-log2 ${params.cnv_homdel_log2} \\
+        --homdel-min-bins ${params.cnv_homdel_min_bins} \\
+        --homdel-cohort-frac ${params.cnv_homdel_cohort_frac} \\
+        --homdel-min-cohort ${params.cnv_homdel_min_cohort} \\
         --small-exons ${params.cnv_small_exons} \\
         --outdir . \\
         --out-xlsx cnv_report.xlsx
@@ -233,6 +239,7 @@ workflow CNV_CALLING {
         CNV_FILTER(
             CNVKIT_POSTPROCESS.out.calls.map   { _meta, cns -> cns }.collect(),
             CNVKIT_POSTPROCESS.out.metrics.map { _meta, m   -> m   }.collect(),
+            CNVKIT_POSTPROCESS.out.cnr.map     { _meta, cnr -> cnr }.collect(),
             sex_tsv_ch,
             filter_ch,
             pon_ch,
