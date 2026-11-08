@@ -4,9 +4,11 @@ Germline CNV calling for exome and panel projects. Sarek computes CNVkit
 coverage; BioVarFlow adds the post-processing that makes the calls reportable.
 Validated on the KHCC project — see [cnv_validation.md](cnv_validation.md).
 
-Building panels of normals is **out of scope**. The customer, or a separate PoN
-pipeline, delivers a ready CNVkit reference `.cnn`. This pipeline checks that it
-fits the data and uses it.
+BioVarFlow does not build panels of normals. A separate pipeline,
+[`cnv_normal`](#building-a-pon), does, and delivers `pon.<batch>.cnn` +
+`common_cnv.bed` + `manifest.json`. BioVarFlow checks that delivery against the
+data and uses it; see [Building a PoN](#building-a-pon) for the three client
+situations and which one applies.
 
 ## Turning it on
 
@@ -61,6 +63,7 @@ Somatic mode forces `tools = mutect2`, so CNV calling does not run there.
 |---|---|
 | `cnv_pon` | CNVkit reference `.cnn` built from this project's own normals, by the customer or the `cnv_normal` pipeline. Must come from the same BED as `cnv_targets_bed`. Omit to skip CNV calling. |
 | `cnv_common_bed` | The `common_cnv.bed` delivered with that `.cnn`: cohort-recurrent CNV regions, columns chrom, start, end, type (`DEL`, `DUP`, `DEL/DUP`, `HOMDEL`), `n_samples=N`. Supplying `cnv_pon` without it prints a warning, because the recurrent artifacts it catches then reach Tier 1 and Tier 2. |
+| `cnv_pon_manifest` | The `manifest.json` from the same build. Leave empty and it is looked for next to `cnv_pon`, which is where a delivery puts it, so it normally needs no flag. Setting it to a path that does not exist is an error, rather than silently falling back. |
 
 ### Fixed in nextflow.config
 
@@ -100,6 +103,34 @@ with the validated defaults. Change them in the config per project rather than
 editing the filter.
 
 ## What runs
+
+### CNV_MANIFEST_CHECK (once per run)
+
+Checks the PoN against its `manifest.json` before anything is called, and writes
+`cnv_pon_provenance.tsv`, which `CNV_FILTER` appends to the report's Thresholds
+sheet so a delivered workbook records which normals produced it.
+
+Two findings **stop the run**, both because they corrupt results without looking
+like errors:
+
+| Check | Why it stops |
+|---|---|
+| `targets_bed.md5` differs from `cnv_targets_bed` | different bins, so every log2 ratio is wrong. Stronger than `cnv_pon_check.py`, which compares bin counts and so only catches a size difference |
+| `reference_sex_model` disagrees with `cnv_pon_haploid_x` | `-y` against a female-normalised PoN makes a normal male chrX read as `cn = 0`, which looks like a reportable homozygous deletion |
+
+These warn and continue, because a usable third-party or older PoN may
+legitimately not satisfy them:
+
+- no `manifest.json` at all — the Thresholds sheet then says the provenance is
+  unverified, rather than leaving the row out
+- `cnvkit_version` differs from `cnv_cnvkit_version`
+- no `pons` entry matches the `.cnn` given, so `n_normals` cannot be checked
+- the `.cnn`'s own md5 differs from the manifest's, i.e. the file changed since
+- `n_normals` below `cnv_min_pon_size` — the low-confidence flag already marks
+  the calls themselves
+- `cnv_common_bed`'s md5 differs from the manifest's: almost certainly a BED
+  from a different PoN, which is worse than supplying none, since its regions
+  describe another cohort's artifacts
 
 ### CNVKIT_POSTPROCESS (per sample)
 
@@ -197,10 +228,94 @@ Check the column numbers against the file header if gnomAD publishes a new
 version. Also download "Exome CNV VCF" from the same page for
 `--cnv_gnomad_exome_cnv`.
 
+## Coverage must match the PoN's
+
+A PoN is only valid for coverage computed the same way it was. BioVarFlow takes
+its coverage from sarek's `cnvkit batch` on the preprocessed CRAM; `cnv_normal`
+computes it with `cnvkit.py coverage` directly. They agree because both leave
+these at CNVkit's defaults, and `cnv_normal` pins them explicitly so a future
+CNVkit version cannot silently move one:
+
+| | value | where |
+|---|---|---|
+| antitarget average size | 150000 | `cnv_normal`: `antitarget_avg_size`; sarek: CNVkit default |
+| minimum MAPQ | 0 | `cnv_normal`: `min_mapq = 0`, so no `--min-mapq` is passed |
+| metric | read depth, not read counts | `cnv_normal`: `count_reads = false`, so no `--count` |
+| target BED | `cnv_targets_bed` | md5-checked against the manifest |
+
+Two of these only matter at PoN build time. Once a PoN exists, sarek's
+`cnvkit batch` runs with `--reference`, which suppresses `--targets` and takes
+every bin from the `.cnn` — so the patient run inherits the PoN's binning
+whatever `antitarget_avg_size` would have been. MAPQ and the depth-vs-counts
+choice do apply to the patient's own coverage, and a mismatch there shifts every
+log2 ratio.
+
+Any PoN from outside `cnv_normal` has to match this table. `CNV_MANIFEST_CHECK`
+can only verify what the manifest records, so for a third-party PoN the coverage
+settings are an assumption, not a check.
+
+## Building a PoN
+
+Use the `cnv_normal` pipeline, branch `pon-build-loo` (a separate repository,
+not a submodule of this one). Do not build a reference by hand: the `.cnn` alone is not a delivery, and `common_cnv.bed` and
+`manifest.json` are what make it checkable and the tiers trustworthy.
+
+Which flow applies depends on what the client brings:
+
+| Client brings | Mode | Flow |
+|---|---|---|
+| A ready PoN (`.cnn` + `common_cnv.bed` + `manifest.json`) | A | BioVarFlow with `--cnv_pon --cnv_common_bed` |
+| Normals (FASTQ) + patients | B | normals through sarek preprocessing, then `cnv_normal`, then BioVarFlow on the patients with that PoN |
+| Only patients (>= 20, same kit and lab) | C | patients through BioVarFlow **without** a PoN (CNV skipped), then `cnv_normal` on their CRAMs; the leave-one-out calls are their CNV results |
+
+### Mode C: the cohort is its own PoN
+
+Mode C needs no change in BioVarFlow — with `cnv_pon` unset, `cnvkit` is dropped
+from the tool list, CNV calling is skipped and the SNV side is unaffected.
+
+**Do not then re-run those same samples through BioVarFlow against the PoN built
+from them.** A sample inside its own PoN partly normalises its own CNVs away, so
+real events come back at reduced amplitude or not at all. Their results are
+`cnv_normal`'s leave-one-out calls, in `loo/<sample>/<sample>.call.cns`, where
+each sample was held out of the reference used to call it.
+
+To tier those calls, run the filter directly on them:
+
+```bash
+python3 scripts/filter_cnv.py \
+  --calls 'loo/*/*.call.cns' --cnr 'loo/*/*.cnr' \
+  --sex sex.tsv --batch batch.tsv \
+  --pon A=pon.A.cnn --pon-size A=27 \
+  --panel-bed data/ACMG_SF_plus_HemOnc_MANE_exons_50bp.refseq.bed \
+  --panel-name 'ACMG SF + HemOnc' \
+  --common-bed common_cnv.bed \
+  --gnomad-sv ... --clingen ... --segdup ... \
+  --outdir out --out-xlsx out/cnv_report.xlsx
+```
+
+A `CNV_FILTER`-only entry point (`--cnv_loo_dir`) would make this a pipeline step
+rather than a manual command. Not built.
+
+This caveat is not only about mode C. It is why the KHCC numbers in
+[cnv_validation.md](cnv_validation.md) need reading carefully: 27 of the 32
+samples are inside `pon.A.cnn`, so a pipeline run on them is partly
+self-normalised. IRIC is the exception — `manifest.json` records
+`"excluded": ["IRIC"]`, so its result is clean.
+
 ## Known limits
 
-- **One PoN per run.** Customer batches needing different PoNs would need a
-  per-sample PoN column in the samplesheet.
+- **One PoN per run,** and KHCC already needs two. Batch B (FBWA, SZRM, TIAM,
+  XDMT) is technically distinct: FBWA's bivar is 0.28 against the full cohort
+  and 0.17 against its own batch. `cnv_normal` therefore builds `pon.A.cnn` (27
+  normals) and `pon.B.cnn` (4). Until there is a per-sample PoN column in the
+  samplesheet, run batch B separately with `--cnv_pon pon.B.cnn`; its 4 normals
+  are below `cnv_min_pon_size`, so its calls carry the low-confidence flag.
+- **No clean end-to-end validation on KHCC.** 27 of the 32 samples are inside
+  `pon.A.cnn`, so a pipeline run on them is partly self-normalised. What is left
+  is IRIC (excluded from the PoN, so clean) and the four batch-B samples (whose
+  PoN is below the size threshold). The tier counts in
+  [cnv_validation.md](cnv_validation.md) are a method check, not a clinical
+  validation; that needs a cohort that is not also the PoN.
 - **Report integration not done.** Tier 1 and Tier 2 CNVs are not yet in the
   sample report; they belong in their own CNV section, not mixed with SNV ACMG
   classes.
