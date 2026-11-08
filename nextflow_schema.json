@@ -43,7 +43,7 @@
       "title": "CNV calling",
       "type": "object",
       "fa_icon": "fas fa-chart-area",
-      "description": "CNV calling runs as part of the standard germline pipeline. The only input it needs is this project's panel of normals; the capture kit BED, gene panel and annotation resources are fixed in nextflow.config. Without a panel of normals, CNV calling is skipped and the rest of the run is unaffected. See docs/cnv.md.",
+      "description": "CNV calling runs as part of the standard germline pipeline. Its inputs are this project's panel of normals and the common-CNV BED delivered with it; the capture kit BED, gene panel and annotation resources are fixed in nextflow.config. Without a panel of normals, CNV calling is skipped and the rest of the run is unaffected. See docs/cnv.md.",
       "properties": {
         "cnv_pon": {
           "type": "string",
@@ -51,6 +51,13 @@
           "description": "CNVkit reference built from this project's own normals, delivered by the customer or a separate PoN pipeline. It must be built from the same capture kit BED the project runs on, which the pipeline checks before using it. Leave empty to skip CNV calling.",
           "format": "file-path",
           "pattern": "^\\S*\\.cnn$"
+        },
+        "cnv_common_bed": {
+          "type": "string",
+          "title": "Common CNV regions (common_cnv.bed)",
+          "description": "The common_cnv.bed that ships with the panel of normals, listing cohort-recurrent CNV regions. Part of the PoN delivery, not an independent input: supply the one built alongside cnv_pon, never a BED from a different PoN. Without it, cohort-recurrent artifacts are not recognised and reach Tier 1 and Tier 2.",
+          "format": "file-path",
+          "pattern": "^\\S*\\.bed$"
         }
       }
     }

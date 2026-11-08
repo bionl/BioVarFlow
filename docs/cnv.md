@@ -17,12 +17,18 @@ of normals:
 ```bash
 nextflow run main.nf -profile bionl \
   --input samplesheet.csv --outdir results \
-  --cnv_pon refs/pon_final.cnn
+  --cnv_pon refs/pon.A.cnn \
+  --cnv_common_bed refs/common_cnv.bed
 ```
 
 Everything else -- the capture kit BED, the gene panel, the annotation
 resources and every threshold -- is fixed in `nextflow.config`, not asked of the
-user. `nextflow_schema.json` therefore exposes `cnv_pon` alone.
+user. `nextflow_schema.json` therefore exposes `cnv_pon` and `cnv_common_bed`
+and nothing else.
+
+Those two are **one delivery, not two inputs.** The `common_cnv.bed` is built
+from the same normals as the `.cnn` by the `cnv_normal` pipeline, and a BED from
+a different PoN is worse than no BED at all. Supply the pair or neither.
 
 **Without `--cnv_pon`, CNV calling is skipped** and the rest of the run is
 unaffected: `cnvkit` is dropped from the tool list and a warning naming the
@@ -53,7 +59,8 @@ Somatic mode forces `tools = mutect2`, so CNV calling does not run there.
 
 | Param | Notes |
 |---|---|
-| `cnv_pon` | CNVkit reference `.cnn` built from this project's own normals, by the customer or a separate PoN pipeline. Must come from the same BED as `cnv_targets_bed`. Omit to skip CNV calling. |
+| `cnv_pon` | CNVkit reference `.cnn` built from this project's own normals, by the customer or the `cnv_normal` pipeline. Must come from the same BED as `cnv_targets_bed`. Omit to skip CNV calling. |
+| `cnv_common_bed` | The `common_cnv.bed` delivered with that `.cnn`: cohort-recurrent CNV regions, columns chrom, start, end, type (`DEL`, `DUP`, `DEL/DUP`, `HOMDEL`), `n_samples=N`. Supplying `cnv_pon` without it prints a warning, because the recurrent artifacts it catches then reach Tier 1 and Tier 2. |
 
 ### Fixed in nextflow.config
 
@@ -64,9 +71,15 @@ Per project -- change these when the project changes capture kit or panel:
 | `cnv_targets_bed` | `data/xgen_v2_targets.hg38.cnvkit.bed` (IDT xGen Exome v2, hg38). 4 columns, gene names without exon suffixes. **The PoN must be built from this exact BED.** Not passed to sarek -- it records the PoN's provenance and is the BED to build a new PoN against. |
 | `cnv_panel_bed` | `data/ACMG_SF_plus_HemOnc_MANE_exons_50bp.refseq.bed` -- the genes a CNV must hit to reach Tier 1. The gene panel, not the capture kit. |
 | `cnv_panel_name` | `ACMG SF + HemOnc`, the label on the report |
-| `cnv_common_bed` | `null`. Cohort-recurrent CNV regions, if the PoN was delivered with them; left null the recurrent-region filter is not applied. |
 | `cnv_pon_haploid_x` | `false`. Set `true` only if the PoN was built with `cnvkit reference -y`. |
 | `cnv_pon_size` | `null`. Normals in the PoN, for the low-confidence flag. Left null, no call is flagged on PoN size. |
+
+`cnv_common_bed` moved out of this table: it is a per-PoN input, not a per-project
+constant. Measured on KHCC, filtering XZJR against `pon.A.cnn` without it moved
+Tier 1 from 0 to 2 (a chr2 `TTN` DUP at +0.36 and a chr2 `COL3A1` DUP at +0.53,
+both cohort-recurrent artifacts) and Tier 2 from 7 to 24. EYTA went 0 to 1
+Tier 1 and 11 to 14 Tier 2. Its `HOMDEL` rows matter most in single-sample runs,
+where the in-run recurrence test (>= 3 samples homozygous) cannot fire.
 
 Shared by every hg38 project, alongside the VEP references:
 
