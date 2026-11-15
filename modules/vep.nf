@@ -2,9 +2,9 @@
 nextflow.enable.dsl=2
 
 // -------- Parameters (used by processes) --------
-params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_plus_HemOnc_MANE_exons_50bp.refseq.bed"
+params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_plus_MorbidGenes_MANE_exons_50bp.bed"
 params.sf_genes    = params.sf_genes    ?: "${workflow.projectDir}/data/acmg_sf_gene_list.txt"
-params.hemonc_genes= params.hemonc_genes?: "${workflow.projectDir}/data/hemonc.txt"
+params.morbid_genes= params.morbid_genes?: "${workflow.projectDir}/data/morbid.txt"
 params.outdir      = params.outdir      ?: "results"
 params.scriptdir   = params.scriptdir   ?: "${workflow.projectDir}/scripts"
 params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/template-files"
@@ -572,7 +572,7 @@ process LeanReport {
           path(exomiser_tsv)
     each path(script)
     each path(sf_genes_file)
-    each path(hemonc_genes_file)
+    each path(morbid_genes_file)
     each path(mane_map)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants.xlsx")
@@ -588,7 +588,7 @@ process LeanReport {
     --acmg-thresholds ${thresholds} \
     --sexcheck ${sex_check} \
     --sf-genes ${sf_genes_file} \
-    --hemonc-genes ${hemonc_genes_file} \
+    --morbid-genes ${morbid_genes_file} \
     --gaps20 ${gaps20} --gaps30 ${gaps30} \
     --strand-bias ${strand_bias} \
     --sites-vcf ${sites_vcf} \
@@ -639,9 +639,9 @@ workflow POST_SAREK {
     template_dir_ch = Channel.fromPath("${params.template_dir}", type: 'dir').first()
     // Gene-set lists for the lean report. Staged as value channels so Nextflow
     // stages them into every LeanReport task (works both locally and on cloud).
-    // Overridable via --sf_genes / --hemonc_genes (defaults in params block above).
+    // Overridable via --sf_genes / --morbid_genes (defaults in params block above).
     sf_genes_ch     = Channel.fromPath(params.sf_genes).first()
-    hemonc_genes_ch = Channel.fromPath(params.hemonc_genes).first()
+    morbid_genes_ch = Channel.fromPath(params.morbid_genes).first()
     // VCF path
     BedFilterVCF(sample_inputs.map { s, vcf, bam, bai -> tuple(s, vcf) }, bed_ch)
     // Reference for left-alignment/trimming. params.fasta is the GATK
@@ -786,7 +786,7 @@ workflow POST_SAREK {
       .join(exomiser_ch, remainder: true)
       .filter { s, tup, exo -> tup != null }
       .map    { s, tup, exo -> tup + [ exo ?: no_exomiser ] }
-    LeanReport(lean_with_exo_ch, script_ch, sf_genes_ch, hemonc_genes_ch, mane_map_ch)
+    LeanReport(lean_with_exo_ch, script_ch, sf_genes_ch, morbid_genes_ch, mane_map_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 
     // collect() so this fires once, with every sample's workbook staged.

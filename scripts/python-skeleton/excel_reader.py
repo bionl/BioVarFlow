@@ -4,9 +4,9 @@ Excel Data Reader Module
 Handles reading and processing Excel files for the ACMG SF Variants Report.
 Maps Excel data to template variables according to the data mapping guide.
 
-BioVarFlow_HemOnc branch: also handles the optional HemOnc sheets
-('HemOnc (Reportable)', 'HemOnc Coverage gaps', 'HemOnc Genes Coverage') written
-by generate_lean_report_org.py when --hemonc-genes is supplied.
+BioVarFlow_Morbid branch: also handles the optional Morbid sheets
+('Morbid (Reportable)', 'Morbid Coverage gaps', 'Morbid Genes Coverage') written
+by generate_lean_report_org.py when --morbid-genes is supplied.
 """
 
 import pandas as pd
@@ -45,11 +45,11 @@ class ExcelDataReader:
             'ACMG SF (Reportable)': True,
             'Coverage gaps': False,  # Optional
             'ACMG Genes Coverage': False,  # Optional
-            # HemOnc sheets — optional; present only on runs that supplied
-            # --hemonc-genes to the lean-report script.
-            'HemOnc (Reportable)': False,
-            'HemOnc Coverage gaps': False,
-            'HemOnc Genes Coverage': False,
+            # Morbid sheets — optional; present only on runs that supplied
+            # --morbid-genes to the lean-report script.
+            'Morbid (Reportable)': False,
+            'Morbid Coverage gaps': False,
+            'Morbid Genes Coverage': False,
         }
 
     def read_all_tabs(self) -> Dict[str, pd.DataFrame]:
@@ -72,8 +72,8 @@ class ExcelDataReader:
 
             # Special handling for ClinVar_Link column to extract URLs from
             # HYPERLINK formulas. Applied to every variants sheet that carries
-            # such formulas (ACMG SF and, on the HemOnc branch, HemOnc too).
-            for variants_sheet in ('ACMG SF (Reportable)', 'HemOnc (Reportable)'):
+            # such formulas (ACMG SF and, on the Morbid branch, Morbid too).
+            for variants_sheet in ('ACMG SF (Reportable)', 'Morbid (Reportable)'):
                 if variants_sheet in excel_data:
                     excel_data[variants_sheet] = self._extract_hyperlinks(
                         self.excel_path,
@@ -179,11 +179,11 @@ class ExcelDataReader:
         # Process coverage data for Page 3
         template_data.update(self._process_coverage_data(data))
 
-        # Process HemOnc data (BioVarFlow_HemOnc branch). Only fills the
-        # dedicated HemOnc pages when the corresponding sheets are present in
-        # the workbook; otherwise the HemOnc pages render with their default
+        # Process Morbid data (BioVarFlow_Morbid branch). Only fills the
+        # dedicated Morbid pages when the corresponding sheets are present in
+        # the workbook; otherwise the Morbid pages render with their default
         # "no data" placeholders (safe on ACMG-only runs).
-        template_data.update(self._process_hemonc_data(data))
+        template_data.update(self._process_morbid_data(data))
 
         return template_data
 
@@ -211,7 +211,7 @@ class ExcelDataReader:
         # Set defaults for missing data
         header_data.setdefault('assay', 'WES')
         header_data.setdefault('reference_build', 'GRCh38')
-        header_data.setdefault('pipeline', 'BioVarFlow_HemOnc v1.1.0')
+        header_data.setdefault('pipeline', 'BioVarFlow_Morbid v1.1.0')
         header_data.setdefault('databases', 'ClinVar (2025-01), gnomAD v4.1, Ensembl VEP Release 115, REVEL (latest release), AlphaMissense (Science 2023, updated 2025-05)')
 
         return header_data
@@ -392,36 +392,36 @@ class ExcelDataReader:
         return coverage_data
 
     # ---------------------------------------------------------------
-    # HemOnc (BioVarFlow_HemOnc branch)
+    # Morbid (BioVarFlow_Morbid branch)
     # ---------------------------------------------------------------
-    def _process_hemonc_data(self, data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    def _process_morbid_data(self, data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         """
-        Extract HemOnc-scoped data from the workbook.
+        Extract Morbid-scoped data from the workbook.
 
         Returns a dict with keys the template processor consumes:
-          - hemonc_page1_variants     : list[dict] — variants with ClinVar ≥2 stars
-          - hemonc_page2_variants     : list[dict] — variants with ClinVar <2 stars / VUS
-          - hemonc_coverage_gaps      : list[dict] — HemOnc exons with %20x < 100
-          - hemonc_overall_coverage   : list[dict] — per-gene HemOnc coverage rollup
-          - hemonc_covered_percent    : str        — Sample Summary metric formatted %
-          - hemonc_available          : bool       — True iff any HemOnc sheet was present
+          - morbid_page1_variants     : list[dict] — variants with ClinVar ≥2 stars
+          - morbid_page2_variants     : list[dict] — variants with ClinVar <2 stars / VUS
+          - morbid_coverage_gaps      : list[dict] — Morbid exons with %20x < 100
+          - morbid_overall_coverage   : list[dict] — per-gene Morbid coverage rollup
+          - morbid_covered_percent    : str        — Sample Summary metric formatted %
+          - morbid_available          : bool       — True iff any Morbid sheet was present
 
         All values default to empty / '—' when the corresponding sheets are
         absent, so this method is safe to call on ACMG-only workbooks.
         """
         result: Dict[str, Any] = {
-            'hemonc_page1_variants': [],
-            'hemonc_page2_variants': [],
-            'hemonc_coverage_gaps': [],
-            'hemonc_overall_coverage': [],
-            'hemonc_covered_percent': '—',
-            'hemonc_available': False,
+            'morbid_page1_variants': [],
+            'morbid_page2_variants': [],
+            'morbid_coverage_gaps': [],
+            'morbid_overall_coverage': [],
+            'morbid_covered_percent': '—',
+            'morbid_available': False,
         }
 
         # ---- variants (mirrors _process_variant_data's ACMG logic) ----
-        if 'HemOnc (Reportable)' in data:
-            result['hemonc_available'] = True
-            df = data['HemOnc (Reportable)']
+        if 'Morbid (Reportable)' in data:
+            result['morbid_available'] = True
+            df = data['Morbid (Reportable)']
             if 'ClinVar' in df.columns and len(df) > 0:
                 # No pathogenicity filter -- the sheet already defines
                 # membership. See the ACMG SF block above.
@@ -459,14 +459,14 @@ class ExcelDataReader:
                     # Same rule as the ACMG SF pages above: >= 2 stars AND an
                     # actual (likely) pathogenic classification.
                     if stars >= 2 and _is_pathogenic_clinvar(row.get('ClinVar')):
-                        result['hemonc_page1_variants'].append(variant_data)
+                        result['morbid_page1_variants'].append(variant_data)
                     else:
-                        result['hemonc_page2_variants'].append(variant_data)
+                        result['morbid_page2_variants'].append(variant_data)
 
         # ---- coverage gaps (mirrors ACMG "Coverage gaps" handling) ----
-        if 'HemOnc Coverage gaps' in data:
-            result['hemonc_available'] = True
-            gaps_df = data['HemOnc Coverage gaps']
+        if 'Morbid Coverage gaps' in data:
+            result['morbid_available'] = True
+            gaps_df = data['Morbid Coverage gaps']
             for _, row in gaps_df.iterrows():
                 coverage_pct = row.get('Pct>=20x', 100)
                 try:
@@ -482,18 +482,18 @@ class ExcelDataReader:
                 }
 
                 if coverage_pct < 100:
-                    result['hemonc_coverage_gaps'].append(gene_data)
+                    result['morbid_coverage_gaps'].append(gene_data)
 
         # ---- per-gene overall coverage grid ----
         # Unmeasured genes (Pct20 = NaN) are rendered as "NA" so the grid
         # remains honest about scope. This is important when the pipeline
-        # was run against a BED that doesn't include every HemOnc gene
-        # (e.g. a legacy ACMG-only mosdepth run followed by a HemOnc-aware
-        # lean-report re-render): the 79 non-overlap HemOnc genes still
+        # was run against a BED that doesn't include every panel gene
+        # (e.g. an ACMG-only mosdepth run followed by a panel-aware
+        # lean-report re-render): genes outside the measured BED still
         # appear on the report, clearly marked as not measured.
-        if 'HemOnc Genes Coverage' in data:
-            result['hemonc_available'] = True
-            df = data['HemOnc Genes Coverage']
+        if 'Morbid Genes Coverage' in data:
+            result['morbid_available'] = True
+            df = data['Morbid Genes Coverage']
             for _, row in df.iterrows():
                 raw_pct = row.get('Pct20', None)
                 if raw_pct is None or pd.isna(raw_pct):
@@ -504,20 +504,20 @@ class ExcelDataReader:
                     except (ValueError, TypeError):
                         coverage_str = 'NA'
 
-                result['hemonc_overall_coverage'].append({
+                result['morbid_overall_coverage'].append({
                     'gene':       row.get('Gene', '—'),
                     'transcript': row.get('MANE_ID', '—'),
                     'coverage':   coverage_str,
                 })
 
-        # ---- HemOnc-scoped Sample Summary metric ----
+        # ---- Morbid-scoped Sample Summary metric ----
         if 'Sample Summary' in data and len(data['Sample Summary']) > 0:
             ss_row = data['Sample Summary'].iloc[0]
-            pct = ss_row.get('HemOnc_PctRegionsCovered', None)
+            pct = ss_row.get('Morbid_PctRegionsCovered', None)
             if pct is not None and pd.notna(pct):
                 try:
-                    result['hemonc_covered_percent'] = f"{float(pct):.2f}%"
+                    result['morbid_covered_percent'] = f"{float(pct):.2f}%"
                 except (ValueError, TypeError):
-                    result['hemonc_covered_percent'] = str(pct)
+                    result['morbid_covered_percent'] = str(pct)
 
         return result

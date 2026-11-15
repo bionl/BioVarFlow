@@ -39,7 +39,7 @@ import sys
 import pandas as pd
 
 PRIORITISED = "Prioritised"
-REPORTABLE = "HemOnc (Reportable)"
+REPORTABLE = "Morbid (Reportable)"
 ACMG = "ACMG SF (Reportable)"
 # ENST -> RefSeq, derived from the NCBI MANE summary (see --mane).
 DEFAULT_MANE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -187,11 +187,9 @@ def rows_superset(xl, mane, reportable_sheet):
     """Every Reportable variant, plus Exomiser's off-panel hits.
 
     Prioritised alone is NOT safe as the spine. It is built from Exomiser's
-    output, and Exomiser filters before it ranks -- ~570 of ~240,000 variants
-    survive for a typical case, with intronic, synonymous and common ones
-    discarded. On IQMM that left 27 of 29 HemOnc and 17 of 22 ACMG SF
-    Reportable variants absent from Prioritised, including a Pathogenic GATA2
-    in another case. Panel membership already justifies a row; Exomiser is
+    output, and Exomiser filters before it ranks -- intronic, synonymous and
+    common variants are discarded before scoring, so most Reportable variants
+    are absent from it. Panel membership already justifies a row; Exomiser is
     supporting evidence, not a gate.
 
     So: take the Reportable sheets whole, attach Exomiser rank/score where it
@@ -207,7 +205,7 @@ def rows_superset(xl, mane, reportable_sheet):
     panel = panel_lookup(xl)
     out, seen = [], {}
 
-    for sheet, tag in ((ACMG, "ACMG SF"), (reportable_sheet, "HemOnc")):
+    for sheet, tag in ((ACMG, "ACMG SF"), (reportable_sheet, "Morbid")):
         df = xl.get(sheet)
         if df is None or not len(df):
             continue

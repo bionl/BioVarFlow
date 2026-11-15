@@ -32,9 +32,9 @@ include { MANIFEST } \
 // Default parameters
 params.input                  = params.input ?: params.samplesheet
 params.outdir                 = params.outdir ?: params.output
-params.bed                    = params.bed ?: "${workflow.projectDir}/data/ACMG_SF_plus_HemOnc_MANE_exons_50bp.refseq.bed"
+params.bed                    = params.bed ?: "${workflow.projectDir}/data/ACMG_SF_plus_MorbidGenes_MANE_exons_50bp.bed"
 params.sf_genes               = params.sf_genes ?: "${workflow.projectDir}/data/acmg_sf_gene_list.txt"
-params.hemonc_genes           = params.hemonc_genes ?: "${workflow.projectDir}/data/hemonc.txt"
+params.morbid_genes           = params.morbid_genes ?: "${workflow.projectDir}/data/morbid.txt"
 //params.run_variant_calling    = params.run_variant_calling instanceof Boolean ? params.run_variant_calling : true
 params.create_consensus       = params.create_consensus instanceof Boolean ? params.create_consensus : true
 params.run_db_qc              = params.run_db_qc instanceof Boolean ? params.run_db_qc : true

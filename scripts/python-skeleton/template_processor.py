@@ -52,7 +52,7 @@ class TemplateProcessor:
         html_content = self._substitute_variant_tables(html_content, data)
         html_content = self._substitute_qc_metrics(html_content, data)
         html_content = self._substitute_coverage_data(html_content, data)
-        html_content = self._substitute_hemonc_section(html_content, data)
+        html_content = self._substitute_morbid_section(html_content, data)
         html_content = self._substitute_methods_limitations(html_content, data)
 
         return html_content
@@ -85,7 +85,7 @@ class TemplateProcessor:
         replacements = {
             'GRCh38': reference_build,
             '2025-09-04 08:58': data.get('report_generated', ''),
-            'Sarek 3.5.1 - ClinLEAN Reporting Workflow v1': data.get('pipeline', 'BioVarFlow_HemOnc v1.1.0'),
+            'Sarek 3.5.1 - ClinLEAN Reporting Workflow v1': data.get('pipeline', 'BioVarFlow_Morbid v1.1.0'),
             'ClinVar, gnomAD (v4.1), VEP/Ensembl (Release 115)': data.get('databases', 'ClinVar (2025-01), gnomAD v4.1, Ensembl VEP Release 115, REVEL (latest release), AlphaMissense (Science 2023, updated 2025-05) SpliceAI (version 1.3.1), BayesDel (version 1.0)'),
         }
 
@@ -188,9 +188,9 @@ class TemplateProcessor:
         """Replace coverage data for both sections on Page 3"""
 
         # Coverage gaps section
-        # NOTE: count=1 — the HemOnc page has its own identical fallback
-        # sentence, filled separately by _substitute_hemonc_section. Without
-        # this limit, ACMG gaps content would bleed into the HemOnc page.
+        # NOTE: count=1 — the Morbid page has its own identical fallback
+        # sentence, filled separately by _substitute_morbid_section. Without
+        # this limit, ACMG gaps content would bleed into the Morbid page.
         coverage_gaps = data.get('coverage_gaps', [])
         print(coverage_gaps)
         if coverage_gaps:
@@ -202,9 +202,9 @@ class TemplateProcessor:
             )
 
         # Overall coverage section
-        # NOTE: count=1 — same reason as above; the HemOnc page also has a
+        # NOTE: count=1 — same reason as above; the Morbid page also has a
         # <div class="coverage-grid">…</div> block, filled by
-        # _substitute_hemonc_section using its own marker regions.
+        # _substitute_morbid_section using its own marker regions.
         overall_coverage = data.get('overall_coverage', [])
         if overall_coverage:
             coverage_grid_html = self._generate_coverage_grid_html(overall_coverage)
@@ -264,16 +264,16 @@ class TemplateProcessor:
         return '\n'.join(items)
 
     # ---------------------------------------------------------------
-    # HemOnc pages (BioVarFlow_HemOnc branch)
+    # Morbid pages (BioVarFlow_Morbid branch)
     # ---------------------------------------------------------------
-    def _substitute_hemonc_section(self, html: str, data: Dict[str, Any]) -> str:
+    def _substitute_morbid_section(self, html: str, data: Dict[str, Any]) -> str:
         """
-        Fill the four marker regions on the three HemOnc pages of the template:
-          - HEMONC_VARIANTS_HIGH_{START,END}   → variants with ClinVar ≥2 stars
-          - HEMONC_VARIANTS_LOW_{START,END}    → variants with ClinVar <2 stars / VUS
-          - HEMONC_COVERAGE_GAPS_{START,END}   → exons with %20x < 100
-          - HEMONC_COVERAGE_GRID_{START,END}   → per-gene overall coverage grid
-          - HEMONC_COVERED_PCT_{START,END}     → Sample Summary metric cell
+        Fill the four marker regions on the three Morbid pages of the template:
+          - MORBID_VARIANTS_HIGH_{START,END}   → variants with ClinVar ≥2 stars
+          - MORBID_VARIANTS_LOW_{START,END}    → variants with ClinVar <2 stars / VUS
+          - MORBID_COVERAGE_GAPS_{START,END}   → exons with %20x < 100
+          - MORBID_COVERAGE_GRID_{START,END}   → per-gene overall coverage grid
+          - MORBID_COVERED_PCT_{START,END}     → Sample Summary metric cell
 
         Each marker's default content (a "no data" placeholder) is preserved
         when the corresponding data list is empty, so ACMG-only runs render
@@ -295,35 +295,35 @@ class TemplateProcessor:
             return pattern.sub(lambda _m: wrapped, html, count=1)
 
         # ---- High-confidence variant table ----
-        page1 = data.get('hemonc_page1_variants', [])
+        page1 = data.get('morbid_page1_variants', [])
         rows = self._generate_variant_rows(page1)
         if not rows:
             rows = '<tr><td colspan="4" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
-        html = replace_between(html, 'HEMONC_VARIANTS_HIGH_START', 'HEMONC_VARIANTS_HIGH_END', rows)
+        html = replace_between(html, 'MORBID_VARIANTS_HIGH_START', 'MORBID_VARIANTS_HIGH_END', rows)
 
         # ---- Lower-confidence variant table ----
-        page2 = data.get('hemonc_page2_variants', [])
+        page2 = data.get('morbid_page2_variants', [])
         rows = self._generate_variant_rows(page2)
         if not rows:
             rows = '<tr><td colspan="4" class="text-center">No variants meeting these criteria were identified in this sample.</td></tr>'
-        html = replace_between(html, 'HEMONC_VARIANTS_LOW_START', 'HEMONC_VARIANTS_LOW_END', rows)
+        html = replace_between(html, 'MORBID_VARIANTS_LOW_START', 'MORBID_VARIANTS_LOW_END', rows)
 
         # ---- Coverage gaps list ----
-        gaps = data.get('hemonc_coverage_gaps', [])
+        gaps = data.get('morbid_coverage_gaps', [])
         gaps_html = (self._generate_coverage_gaps_html(gaps)
                      if gaps
                      else '<p class="no-data">No exons below 20x coverage.</p>')
-        html = replace_between(html, 'HEMONC_COVERAGE_GAPS_START', 'HEMONC_COVERAGE_GAPS_END', gaps_html)
+        html = replace_between(html, 'MORBID_COVERAGE_GAPS_START', 'MORBID_COVERAGE_GAPS_END', gaps_html)
 
         # ---- Overall coverage grid ----
-        grid = data.get('hemonc_overall_coverage', [])
+        grid = data.get('morbid_overall_coverage', [])
         grid_html = self._generate_coverage_grid_html(grid) if grid else ''
-        html = replace_between(html, 'HEMONC_COVERAGE_GRID_START', 'HEMONC_COVERAGE_GRID_END', grid_html)
+        html = replace_between(html, 'MORBID_COVERAGE_GRID_START', 'MORBID_COVERAGE_GRID_END', grid_html)
 
-        # ---- HemOnc-scoped Sample Summary metric cell ----
-        pct = data.get('hemonc_covered_percent', '—')
+        # ---- Morbid-scoped Sample Summary metric cell ----
+        pct = data.get('morbid_covered_percent', '—')
         cell_html = f'<td class="metric-value">{pct}</td>'
-        html = replace_between(html, 'HEMONC_COVERED_PCT_START', 'HEMONC_COVERED_PCT_END', cell_html)
+        html = replace_between(html, 'MORBID_COVERED_PCT_START', 'MORBID_COVERED_PCT_END', cell_html)
 
         return html
 
@@ -336,7 +336,7 @@ class TemplateProcessor:
         # Methods and limitations
         replacements = {
             '2025-10-05 08:58': data.get('report_generated', ''),
-            'BioVarFlow_HemOnc v1.1.0': data.get('pipeline', 'BioVarFlow_HemOnc v1.1.0'),
+            'BioVarFlow_Morbid v1.1.0': data.get('pipeline', 'BioVarFlow_Morbid v1.1.0'),
         }
 
         for old_value, new_value in replacements.items():

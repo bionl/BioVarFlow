@@ -26,10 +26,10 @@ p.add_argument("--mosdepth-summary", default=None, help="mosdepth *.summary.txt 
 p.add_argument("--verifybamid", default=None, help="verifyBamID2 *.selfSM or .summary output (FREEMIX)")
 p.add_argument("--sexcheck", default=None, help="file with inferred sex (one line like: Sex: Male)")
 p.add_argument("--sf-genes", default=None, help="ACMG SF gene list (one gene SYMBOL per line)")
-p.add_argument("--hemonc-genes", default=None,
-               help="HemOnc gene list (one gene SYMBOL per line). "
-                    "When provided, three extra sheets are written: 'HemOnc (Reportable)', "
-                    "'HemOnc Coverage gaps', 'HemOnc Genes Coverage'.")
+p.add_argument("--morbid-genes", default=None,
+               help="Morbid gene list (one gene SYMBOL per line). "
+                    "When provided, three extra sheets are written: 'Morbid (Reportable)', "
+                    "'Morbid Coverage gaps', 'Morbid Genes Coverage'.")
 p.add_argument("--acmg-thresholds", default=None,
                help="mosdepth thresholds.bed(.gz) run with ACMG BED (cols: chrom start end [region] 20X 30X)")
 p.add_argument("--gaps20", default=None, help="annotated gaps <20x BED (chrom start end RegionLabel)")
@@ -389,8 +389,8 @@ def acmg_pct_regions_covered(th_path, min_depth=20, gene_set=None, key_prefix="A
         in the source BED). If None, all regions are used (legacy behaviour).
     key_prefix : str
         Prefix for the returned metric keys. Default "ACMG" preserves the
-        legacy keys ("ACMG_PctRegionsCovered", ...). Pass e.g. "HemOnc" to
-        produce parallel HemOnc-scoped metrics.
+        legacy keys ("ACMG_PctRegionsCovered", ...). Pass e.g. "Morbid" to
+        produce parallel Morbid-scoped metrics.
 
     Returns
     -------
@@ -795,13 +795,13 @@ if args.sf_genes and os.path.exists(args.sf_genes):
             g = l.strip().split()[0]
             if g: sf_genes.add(g)
 
-# Optional HemOnc gene list (BioVarFlow_HemOnc branch)
-hemonc_genes = set()
-if args.hemonc_genes and os.path.exists(args.hemonc_genes):
-    with open(args.hemonc_genes) as f:
+# Optional Morbid gene list (BioVarFlow_Morbid branch)
+morbid_genes = set()
+if args.morbid_genes and os.path.exists(args.morbid_genes):
+    with open(args.morbid_genes) as f:
         for l in f:
             g = l.strip().split()[0] if l.strip() else ""
-            if g and not g.startswith("#"): hemonc_genes.add(g)
+            if g and not g.startswith("#"): morbid_genes.add(g)
 
 # -------------------------
 # Parse VCF to dataframe
@@ -1257,16 +1257,16 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     # Mosdepth means
     ss.update(parse_mosdepth_summary_regions(args.mosdepth_summary))
     # Scope the ACMG region-coverage metric to the ACMG SF gene set (so it isn't
-    # diluted by HemOnc regions when using a merged ACMG+HemOnc BED). Fall back
+    # diluted by Morbid regions when using a merged ACMG+Morbid BED). Fall back
     # to the legacy "all regions" behaviour when no SF list is provided.
     ss.update(acmg_pct_regions_covered(args.acmg_thresholds,
                                        gene_set=sf_genes if sf_genes else None,
                                        key_prefix="ACMG"))
-    # Parallel HemOnc-scoped metric (only emitted when a HemOnc list is provided).
-    if hemonc_genes:
+    # Parallel Morbid-scoped metric (only emitted when a Morbid list is provided).
+    if morbid_genes:
         ss.update(acmg_pct_regions_covered(args.acmg_thresholds,
-                                           gene_set=hemonc_genes,
-                                           key_prefix="HemOnc"))
+                                           gene_set=morbid_genes,
+                                           key_prefix="Morbid"))
     # Contamination & sex
     ss.update(parse_verifybamid(args.verifybamid))
     ss.update(parse_sexcheck(args.sexcheck))
@@ -1291,7 +1291,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
 
     # ---------------------------------------------------------------
     # Helper: write the three per-gene-set sheets (variants, coverage
-    # gaps, per-gene rollup). Shared by the ACMG SF and HemOnc blocks.
+    # gaps, per-gene rollup). Shared by the ACMG SF and Morbid blocks.
     # ---------------------------------------------------------------
     def make_hyperlink(u):
         return f'=HYPERLINK("{u}","{u}")' if u else ""
@@ -1456,14 +1456,14 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         genes_cov_sheet="ACMG SF Genes Coverage",
     )
 
-    # 4b) HemOnc sheets (BioVarFlow_HemOnc branch). Only written when a
-    # HemOnc gene list was supplied via --hemonc-genes.
-    if hemonc_genes:
+    # 4b) Morbid sheets (BioVarFlow_Morbid branch). Only written when a
+    # Morbid gene list was supplied via --morbid-genes.
+    if morbid_genes:
         write_gene_set_sheets(
-            gene_set=hemonc_genes,
-            variants_sheet="HemOnc (Reportable)",
-            gaps_sheet="HemOnc Coverage gaps",
-            genes_cov_sheet="HemOnc Genes Coverage",
+            gene_set=morbid_genes,
+            variants_sheet="Morbid (Reportable)",
+            gaps_sheet="Morbid Coverage gaps",
+            genes_cov_sheet="Morbid Genes Coverage",
         )
 
     # 5) PASS variant table
@@ -1488,10 +1488,9 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
         # ---- Prioritised: everything we intend to report, in one sheet ----
         #
         # A SUPERSET, not an intersection. It was previously built only from
-        # Exomiser's output, which filters before it ranks -- ~570 of ~240,000
-        # variants survive, with intronic, synonymous and common ones dropped.
-        # That left 27 of 29 HemOnc and 17 of 22 ACMG SF Reportable variants off
-        # the sheet entirely, including a Pathogenic GATA2. Panel membership
+        # Exomiser's output, which filters before it ranks -- intronic,
+        # synonymous and common variants are dropped before scoring, so most
+        # Reportable variants never reach the sheet at all. Panel membership
         # already justifies a row; Exomiser is supporting evidence, not a gate.
         #
         #   PANEL_REPORTABLE  every row of both Reportable sheets, with the
@@ -1510,7 +1509,7 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
 
         _rows, _seen = [], {}
         for _sheet_name, _rs in reportable_sheets:
-            _tag = "ACMG SF" if _sheet_name.startswith("ACMG") else "HemOnc"
+            _tag = "ACMG SF" if _sheet_name.startswith("ACMG") else "Morbid"
             for _, r in _rs.iterrows():
                 _key = str(r.get("Variant"))
                 if _key in _seen:                 # genes listed on both panels
