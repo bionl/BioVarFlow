@@ -2,7 +2,11 @@
 nextflow.enable.dsl=2
 
 params.outdir = params.outdir ?: "results"
-params.ref_fasta = params.ref_fasta ?: params.vep_fasta
+// Reference for bcftools norm -f below. NOT defaulted to params.vep_fasta --
+// that is the Ensembl build (contigs 1/2/.../MT) while the BAMs are chr-prefixed
+// GATK, so -f failed on every record. main.nf resolves the GATK assembly via
+// resolveConsensusFasta() and passes it in as a process input.
+params.ref_fasta = params.ref_fasta ?: null
 
 /********************  CONSENSUS CALLING PROCESSES  ********************/
 process CONS_REHEADER_VCF {
@@ -51,8 +55,12 @@ process NormalizeDV {
   
   script:
   """
-  #bcftools norm -f ${ref_fasta} ${vcf} -Oz -o ${sample}.dv.norm.vcf.gz
-  bcftools norm -m -any ${vcf} -Oz -o ${sample}.dv.norm.vcf.gz
+  # -m -any splits multiallelics; -f left-aligns and trims. Both are needed:
+  # without -f, DV and HC can emit the same indel with different REF spans
+  # (e.g. 15bp vs 17bp in a repeat tract), and the bcftools isec below --
+  # which matches on exact CHROM/POS/REF/ALT -- then tags a concordant call
+  # as caller-specific, sending it to the stricter single-caller filter tier.
+  bcftools norm -m -any -f ${ref_fasta} ${vcf} -Oz -o ${sample}.dv.norm.vcf.gz
   bcftools index -t ${sample}.dv.norm.vcf.gz
   bcftools view -f PASS,. ${sample}.dv.norm.vcf.gz -Oz -o ${sample}.dv.norm.pass.vcf.gz
   bcftools index -t ${sample}.dv.norm.pass.vcf.gz
@@ -73,8 +81,12 @@ process NormalizeHC {
   
   script:
   """
-  #bcftools norm -f ${ref_fasta} ${vcf} -Oz -o ${sample}.hc.norm.vcf.gz
-  bcftools norm -m -any ${vcf} -Oz -o ${sample}.hc.norm.vcf.gz
+  # -m -any splits multiallelics; -f left-aligns and trims. Both are needed:
+  # without -f, DV and HC can emit the same indel with different REF spans
+  # (e.g. 15bp vs 17bp in a repeat tract), and the bcftools isec below --
+  # which matches on exact CHROM/POS/REF/ALT -- then tags a concordant call
+  # as caller-specific, sending it to the stricter single-caller filter tier.
+  bcftools norm -m -any -f ${ref_fasta} ${vcf} -Oz -o ${sample}.hc.norm.vcf.gz
   bcftools index -t ${sample}.hc.norm.vcf.gz
   bcftools view -f PASS,. ${sample}.hc.norm.vcf.gz -Oz -o ${sample}.hc.norm.pass.vcf.gz
   bcftools index -t ${sample}.hc.norm.pass.vcf.gz
@@ -113,7 +125,7 @@ process AnnotateDVOnly {
   
   script:
   """
-  echo '##INFO=<ID=CALLERS,Number=.,Type=String,Description="Which callers support this variant (DV,HC)">' > callers.hdr
+  echo '##INFO=<ID=CALLERS,Number=1,Type=String,Description="Which callers support this variant: DV, HC, or DV_HC">' > callers.hdr
   
   bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\tDV\\n' ${dv_only_vcf} > dv_callers.tsv
   bgzip -f dv_callers.tsv
@@ -142,7 +154,7 @@ process AnnotateHCOnly {
   
   script:
   """
-  echo '##INFO=<ID=CALLERS,Number=.,Type=String,Description="Which callers support this variant (DV,HC)">' > callers.hdr
+  echo '##INFO=<ID=CALLERS,Number=1,Type=String,Description="Which callers support this variant: DV, HC, or DV_HC">' > callers.hdr
   
   bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\tHC\\n' ${hc_only_vcf} > hc_callers.tsv
   bgzip -f hc_callers.tsv
@@ -171,9 +183,9 @@ process AnnotateShared {
   
   script:
   """
-  echo '##INFO=<ID=CALLERS,Number=.,Type=String,Description="Which callers support this variant (DV,HC)">' > callers.hdr
+  echo '##INFO=<ID=CALLERS,Number=1,Type=String,Description="Which callers support this variant: DV, HC, or DV_HC">' > callers.hdr
   
-  bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\tDV,HC\\n' ${shared_vcf} > both_callers.tsv
+  bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\tDV_HC\\n' ${shared_vcf} > both_callers.tsv
   bgzip -f both_callers.tsv
   tabix -s 1 -b 2 -e 2 both_callers.tsv.gz
   
@@ -225,8 +237,14 @@ process FilterConsensusVCF {
   
   script:
   """
+  # CALLERS is written DV, HC or DV_HC -- underscore, not "DV,HC". bcftools
+  # treats a comma inside a string INFO value as a value separator and turns ==
+  # into OR, so 'CALLERS="DV,HC"' matched EVERY record (CALLERS==DV or ==HC).
+  # That made the first clause universal and the two single-caller tiers
+  # unreachable, silently reducing the whole filter to DP>=10 && GQ>=10.
+  # Number=1 alone does NOT fix this -- the comma must go from the value.
   bcftools view \
-    -i '((INFO/CALLERS="DV,HC") && FORMAT/DP>=10 && FORMAT/GQ>=10) || \
+    -i '((INFO/CALLERS="DV_HC") && FORMAT/DP>=10 && FORMAT/GQ>=10) || \
         ((INFO/CALLERS="HC") && QUAL>=30 && FORMAT/DP>=10 && FORMAT/GQ>=20) || \
         ((INFO/CALLERS="DV") && QUAL>=10 && FORMAT/DP>=10 && FORMAT/GQ>=20)' \
     ${consensus_vcf} \

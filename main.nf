@@ -41,7 +41,13 @@ params.run_db_qc              = params.run_db_qc instanceof Boolean ? params.run
 // downstream DB ingestion pipeline). Falls back to workflow.runName at
 // manifest-build time if left null.
 params.run_id                 = params.run_id ?: null
-params.ref_fasta              = params.ref_fasta ?: params.vep_fasta
+// Reference for bcftools norm -f in CONSENSUS_CALLING. Deliberately NOT
+// defaulted to params.vep_fasta: that is the Ensembl build whose contigs are
+// named 1/2/.../MT, while the BAMs are chr-prefixed GATK, so -f fails on every
+// record (which is why those calls were previously commented out).
+// Resolved lazily by resolveConsensusFasta() at the point of use, since
+// params.fasta is assigned by external/sarek/main.nf at include time.
+params.ref_fasta              = params.ref_fasta ?: null
 //params.vep_fasta              = params.vep_fasta ?: params.vep_fasta
 
 // Validate required parameters
@@ -65,6 +71,24 @@ params.ref_fasta              = params.ref_fasta ?: params.vep_fasta
 
 def isGcsPath(path) {
     return path.toString().startsWith('gs://')
+}
+
+// Resolve the GATK reference for consensus normalisation. Mirrors
+// resolveNormFasta() in modules/vep.nf; the igenomes map is the reliable
+// fallback because config-parse time always populates it.
+def resolveConsensusFasta() {
+    def f = params.ref_fasta ?: params.fasta
+    if (!f && params.genomes && params.genome && params.genomes.containsKey(params.genome)) {
+        f = params.genomes[params.genome].fasta
+    }
+    if (!f) {
+        error "❌ No reference for consensus normalisation.\n" +
+              "   Tried --ref_fasta, params.fasta, params.genomes[${params.genome}].fasta.\n" +
+              "   genome=${params.genome}  genomes_loaded=${params.genomes ? params.genomes.size() : 0}\n" +
+              "   Set --ref_fasta to the GATK assembly the BAMs were aligned against.\n" +
+              "   Do NOT point this at the Ensembl VEP fasta -- its contigs are 1/2/.../MT."
+    }
+    return f
 }
 
 def validateBedFile() {
@@ -345,8 +369,9 @@ workflow RUN_FROM_VARIANT_CALLING_OUTDIR {
                 }
             
             // Create reference channels
-            ref_fasta_ch = Channel.value(file(params.ref_fasta))
-            ref_fai_ch = Channel.value(file(params.ref_fasta + ".fai"))
+            def _consFasta = resolveConsensusFasta()
+            ref_fasta_ch = Channel.value(file(_consFasta))
+            ref_fai_ch = Channel.value(file(_consFasta + ".fai"))
             
             // Run consensus calling
             CONSENSUS_CALLING(dv_vcf_ch, hc_vcf_ch, ref_fasta_ch, ref_fai_ch)
@@ -584,8 +609,9 @@ workflow RUN_FULL_VARIANT_CALLING {
             MUTECT2_RESCUE(mutect2_vcf_ch, rescue_script_ch)
             final_vcf_ch = MUTECT2_RESCUE.out.map { sample, vcf, tbi -> tuple(sample, vcf) }
         } else if (params.create_consensus) {
-            ref_fasta_ch = Channel.value(file(params.ref_fasta))
-            ref_fai_ch   = Channel.value(file(params.ref_fasta + ".fai"))
+            def _consFasta = resolveConsensusFasta()
+            ref_fasta_ch = Channel.value(file(_consFasta))
+            ref_fai_ch   = Channel.value(file(_consFasta + ".fai"))
 
             CONSENSUS_CALLING(
                 COLLECT_VARIANT_CALLING_OUTPUTS.out.dv_vcf,

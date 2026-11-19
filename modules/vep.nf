@@ -6,6 +6,9 @@ params.bed         = params.bed         ?: "${workflow.projectDir}/data/ACMG_SF_
 // Somatic reporting panel — restricts the somatic (Mutect2) call set to the
 // genes we report on, the same way params.bed scopes the germline ACMG SF set.
 params.somatic_bed = params.somatic_bed ?: "${workflow.projectDir}/data/Somatic_125genes_MANE_50bp.bed"
+// OncoKB cancerGeneList.tsv -- gene-level only (ONCOGENE / TSG / ...). Freely
+// redistributable, unlike OncoKB's variant-level files which are licence-gated.
+params.oncokb_genes = params.oncokb_genes ?: "${workflow.projectDir}/data/oncokb_cancer_gene_list.tsv"
 params.outdir      = params.outdir      ?: "results"
 params.scriptdir   = params.scriptdir   ?: "${workflow.projectDir}/scripts"
 params.template_dir= params.template_dir?: "${workflow.projectDir}/scripts/template-files"
@@ -277,12 +280,19 @@ process CoverageGapsAnnotation {
     | bedtools sort -i - \
     | bedtools merge -i - > ${sample}.acmg_gaps_lt30.bed
 
-  bedtools intersect -wao -a ${sample}.acmg_gaps_lt20.bed -b $bed \
-    | awk 'BEGIN{OFS="\\t"}{ label = (\$7 != "" && \$7 != ".") ? \$7 : \$4 ":" \$5 "-" \$6; print \$1,\$2,\$3,label}' \
+  # Label each gap by the EXON it falls in (chrom:start-end from -b), not the
+  # BED's 4th column: that is GENE|TRANSCRIPT and repeats across every exon of a
+  # gene, collapsing all gaps to gene level and stamping one gene-wide total onto
+  # every exon row. Also CLIP each gap to the exon -- bedtools merge upstream can
+  # join low-coverage runs spanning introns, so unclipped gaps routinely reported
+  # more bp than the exon they were attached to.
+  #   -a: \$1,\$2,\$3 = gap   -b: \$4,\$5,\$6 = exon, \$7 = GENE|TRANSCRIPT
+  bedtools intersect -wo -a ${sample}.acmg_gaps_lt20.bed -b $bed \
+    | awk 'BEGIN{OFS="\\t"}{ s=(\$2>\$5?\$2:\$5); e=(\$3<\$6?\$3:\$6); if(e>s) print \$1,s,e,\$4":"\$5"-"\$6 }' \
     > ${sample}.acmg_gaps_lt20.annot.bed
 
-  bedtools intersect -wao -a ${sample}.acmg_gaps_lt30.bed -b $bed \
-    | awk 'BEGIN{OFS="\\t"}{ label = (\$7 != "" && \$7 != ".") ? \$7 : \$4 ":" \$5 "-" \$6; print \$1,\$2,\$3,label}' \
+  bedtools intersect -wo -a ${sample}.acmg_gaps_lt30.bed -b $bed \
+    | awk 'BEGIN{OFS="\\t"}{ s=(\$2>\$5?\$2:\$5); e=(\$3<\$6?\$3:\$6); if(e>s) print \$1,s,e,\$4":"\$5"-"\$6 }' \
     > ${sample}.acmg_gaps_lt30.annot.bed
   """
 }
@@ -539,6 +549,7 @@ process LeanReport {
           path(somatic_vcf),
           path(somatic_sb)
     each path(script)
+    each path(oncokb_genes)
   output:
     tuple val(meta), path("${meta.sample}_report/${meta.sample}_variants_lean.xlsx")
   script:
@@ -560,6 +571,7 @@ process LeanReport {
     --gaps20 ${gaps20} --gaps30 ${gaps30} \
     --strand-bias ${strand_bias} \
     --germline-source '${gsrc}' \
+    --oncokb-genes ${oncokb_genes} \
     ${som_arg} ${som_sb_arg}
   """
 }
@@ -813,7 +825,8 @@ workflow POST_SAREK {
           items + [ somatic_vcf != null ? somatic_vcf : no_file,
                     somatic_sb  != null ? somatic_sb  : no_file ]
       }
-    LeanReport(lean_input_ch, script_ch)
+    oncokb_genes_ch = Channel.value(file(params.oncokb_genes))
+    LeanReport(lean_input_ch, script_ch, oncokb_genes_ch)
     GENERATE_ACMG_REPORT(LeanReport.out, report_script_ch, template_dir_ch)
 }
 

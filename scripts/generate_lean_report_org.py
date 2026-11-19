@@ -2,7 +2,7 @@
 import sys, os, re, argparse, gzip
 import pandas as pd
 from cyvcf2 import VCF
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 # -------------------------
 # CLI
@@ -50,6 +50,11 @@ p.add_argument("--germline-source", default=None,
                     "calling, so LOH reads as hom and subclonal somatic variants "
                     "read as germline het. Recorded in Sample Summary and used to "
                     "gate the zygosity QC flags.")
+p.add_argument("--oncokb-genes", default=None,
+               help="OncoKB cancerGeneList.tsv (gene-level). Adds OncoKB_Gene_Type "
+                    "(ONCOGENE/TSG/...) and OncoKB_Annotated to the somatic sheets. "
+                    "Gene-level only -- it carries no per-variant oncogenicity call; "
+                    "that needs allAnnotatedVariants.tsv, which requires a licence.")
 p.add_argument("--somatic-vcf", default=None,
                help="VEP-annotated, panel-restricted somatic VCF containing ALL "
                     "in-panel calls (FILTER preserved). PASS and the tumor-only "
@@ -62,6 +67,44 @@ args = p.parse_args()
 # -------------------------
 # Helpers: safe parsers
 # -------------------------
+def load_oncokb_genes(path):
+    """
+    Read OncoKB's cancerGeneList.tsv into {gene_symbol: {...}}.
+
+    This file is GENE-level: it records whether a gene is an oncogene or tumour
+    suppressor and which panels list it, but carries no coordinates and no
+    per-variant oncogenicity call. It keys on Hugo Symbol, so it joins directly
+    onto the VEP SYMBOL already parsed from CSQ -- no protein-change matching,
+    and so none of the three-letter/one-letter conversion problems that
+    variant-level OncoKB data would bring.
+
+    Returns {} when the file is absent, making the join a no-op.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_csv(path, sep="\t", dtype=str).fillna("")
+    except Exception:
+        return {}
+    col = {c.strip().lower(): c for c in df.columns}
+    sym = col.get("hugo symbol")
+    if not sym:
+        return {}
+    gtype, annot = col.get("gene type"), col.get("oncokb annotated")
+    out = {}
+    for _, r in df.iterrows():
+        g = str(r[sym]).strip()
+        if not g:
+            continue
+        # A blank Gene Type is meaningful here (220 rows): OncoKB lists the gene
+        # without classifying it, which differs from the gene being absent.
+        out[g] = {
+            "OncoKB_Gene_Type": ((str(r[gtype]).strip() or "NOT_CLASSIFIED") if gtype else ""),
+            "OncoKB_Annotated": (str(r[annot]).strip() if annot else ""),
+        }
+    return out
+
+
 def safe_float(x):
     try: return float(x)
     except: return None
@@ -310,20 +353,32 @@ def read_acmg_thresholds(th_path, sf_genes=None):
     end   = col("end")   or "end"
     region= col("region")  # may be None if no label in BED
 
-    # Synthesize RegionLabel if missing/blank
-    if (region is None) or (region == 'NA') or (region not in df.columns):
-        df["RegionLabel"] = df[chrom].astype(str) + ":" + df[start].astype(int).astype(str) + "-" + df[end].astype(int).astype(str)
-    else:
-        # If region exists but is empty/unknown, still fall back to coords
-        df["RegionLabel"] = df[region].astype(str)
-        mask_empty = df["RegionLabel"].isin(["", ".", "unknown", "UNKNOWN", "None"])
-        df.loc[mask_empty, "RegionLabel"] = df.loc[mask_empty, chrom].astype(str) + ":" + df.loc[mask_empty, start].astype(int).astype(str) + "-" + df.loc[mask_empty, end].astype(int).astype(str)
+    # RegionLabel is the JOIN KEY against the gaps BED, so it must be unique per
+    # exon. The BED's 4th column is GENE|TRANSCRIPT and repeats across every exon
+    # of a gene -- keying on it collapsed gaps to gene level and stamped one
+    # gene-wide total onto all ~2,088 exon rows. Key on exon coordinates instead;
+    # CoverageGapsAnnotation labels gaps the same way.
+    df["RegionLabel"] = (df[chrom].astype(str) + ":" +
+                         df[start].astype(int).astype(str) + "-" +
+                         df[end].astype(int).astype(str))
 
-    # Optional gene parsing (will be '.' if no names)
-    parts = df["RegionLabel"].astype(str).str.split("|", n=2, expand=True)
-    df["Gene"] = parts[0] if parts.shape[1] > 0 else "."
-    df["MANE_ID"] = parts[1] if parts.shape[1] > 1 else "."
-    df["Exon"] = parts[2] if parts.shape[1] > 2 else "."
+    # Gene / transcript still come from the BED's label column when present.
+    if (region is not None) and (region != 'NA') and (region in df.columns):
+        lbl = df[region].astype(str)
+        lbl = lbl.where(~lbl.isin(["", ".", "unknown", "UNKNOWN", "None"]), other=".")
+        parts = lbl.str.split("|", n=2, expand=True)
+        df["Gene"]    = parts[0] if parts.shape[1] > 0 else "."
+        df["MANE_ID"] = parts[1] if parts.shape[1] > 1 else "."
+    else:
+        df["Gene"] = "."
+        df["MANE_ID"] = "."
+
+    # Exon number: the BED carries no exon index, so derive one by ordering each
+    # gene's intervals along the genome. Previously always "." because splitting
+    # GENE|TRANSCRIPT never yielded a third field.
+    _ord = df.assign(_s=pd.to_numeric(df[start], errors="coerce"))
+    df["Exon"] = (_ord.groupby("Gene")["_s"].rank(method="dense").astype("Int64").astype(str))
+    df.loc[df["Gene"] == ".", "Exon"] = "."
 
     if sf_genes:
         df = df[df["Gene"].isin(sf_genes)]
@@ -985,8 +1040,11 @@ for var in vcf:
         ann = select_csq_entry(var, csq_format) or {}
         gene        = ann.get("SYMBOL")
         transcript  = ann.get("Feature")
-        hgvsc       = ann.get("HGVSc")
-        hgvsp       = ann.get("HGVSp")
+        # VEP percent-encodes reserved characters inside CSQ subfields, so a
+        # synonymous change arrives as "p.Gln342%3D" instead of "p.Gln342=".
+        # Decode here so both the Excel and the HTML report show valid HGVS.
+        hgvsc       = unquote(ann["HGVSc"]) if ann.get("HGVSc") else ann.get("HGVSc")
+        hgvsp       = unquote(ann["HGVSp"]) if ann.get("HGVSp") else ann.get("HGVSp")
         consequence = ann.get("Consequence")
         mane_id = ann.get("MANE_SELECT")
         exon        = ann.get("EXON")
@@ -1381,8 +1439,23 @@ with pd.ExcelWriter(args.xlsx_out) as xw:
     som_all_df   = parse_somatic_vcf(args.somatic_vcf)
     is_tumor_only = somatic_is_tumor_only(args.somatic_vcf)
 
+    # OncoKB gene-level context. Joined on gene SYMBOL, so it applies to every
+    # row regardless of consequence or protein-change notation. Tells a reviewer
+    # whether the gene is an oncogene or tumour suppressor -- which changes how a
+    # truncating variant should be read (loss-of-function matters in a TSG, far
+    # less in an oncogene). NOT a per-variant oncogenicity call: that needs
+    # OncoKB's allAnnotatedVariants.tsv, which is licence-gated.
+    _oncokb = load_oncokb_genes(args.oncokb_genes)
+    if len(som_all_df) and "Gene" in som_all_df.columns:
+        _g = som_all_df["Gene"].astype(str)
+        som_all_df["OncoKB_Gene_Type"] = _g.map(
+            lambda x: _oncokb.get(x, {}).get("OncoKB_Gene_Type", ""))
+        som_all_df["OncoKB_Annotated"] = _g.map(
+            lambda x: _oncokb.get(x, {}).get("OncoKB_Annotated", ""))
+
     som_cols = [
-        "Gene", "Variant", "HGVSc", "HGVSp", "Transcript",
+        "Gene", "OncoKB_Gene_Type", "OncoKB_Annotated",
+        "Variant", "HGVSc", "HGVSp", "Transcript",
         "Consequence", "Impact",
         "GT", "Zygosity", "Clonality", "Germline_QC",
         "VAF", "AD_Ref", "AD_Alt", "DP",
