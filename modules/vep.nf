@@ -111,68 +111,28 @@ process BedFilterBAM {
   """
 }
 
-process CoverageSummary {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
-  input:
-    tuple val(meta), path(bam)
-    path bed
-  output:
-    tuple val(meta), path("${meta.sample}_coverage_summary.sorted.txt"), path("${meta.sample}_coverage_per_base.txt")
-  script:
-    def sample = meta.sample
-  """
-  bedtools coverage -a $bed -b $bam -d > ${sample}_coverage_per_base.txt
-  awk '{
-    key=\$1":"\$2"-"\$3; total[key]++
-    if(\$5>=20) c20[key]++; if(\$5>=30) c30[key]++; if(\$5>=50) c50[key]++; if(\$5>=100) c100[key]++
-  } END {
-    for (k in total)
-      printf "%s\\t>=20x:%.2f%%\\t>=30x:%.2f%%\\t>=50x:%.2f%%\\t>=100x:%.2f%%\\n", k,(c20[k]/total[k])*100,(c30[k]/total[k])*100,(c50[k]/total[k])*100,(c100[k]/total[k])*100
-  }' ${sample}_coverage_per_base.txt > ${sample}_coverage_summary.txt
-  sort -t: -k1,1 -k2,2n ${sample}_coverage_summary.txt > ${sample}_coverage_summary.sorted.txt
-  """
-}
-
-process R1R2Ratio {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay   
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
-  input:
-    tuple val(meta), path(bam), path(bai)
-    path bed
-  output:
-    tuple val(meta), path("${meta.sample}_r1r2_per_exon.tsv")
-  script:
-    def sample = meta.sample
-  """
-  while read chrom start end ref_name; do
-    region="\${chrom}:\${start}-\${end}"
-    counts=\$(samtools view -F 0x904 $bam "\$region" | \
-      awk '{flag=\$2; if(and(flag,64)) r1++; if(and(flag,128)) r2++} END {if(r1+r2>0) printf("%d\\t%d\\t%.3f\\n", r1, r2, r1/(r1+r2)); else print "0\\t0\\tNA"}')
-    echo -e "\${chrom}\\t\${start}\\t\${end}\\t\${ref_name}\\t\${counts}"
-  done < $bed > ${sample}_r1r2_per_exon.tsv
-  """
-}
-
-process ForwardReverseRatio {
-  tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay 
-  publishDir "${params.outdir}/${meta.sample}/qc", mode: 'copy'
-  input:
-    tuple val(meta), path(bam), path(bai)
-    path bed
-  output:
-    tuple val(meta), path("${meta.sample}_frstrand_per_exon.tsv")
-  script:
-    def sample = meta.sample
-  """
-  while read chrom start end ref_name; do
-    region="\${chrom}:\${start}-\${end}"
-    counts=\$(samtools view -F 0x904 $bam "\$region" | \
-      awk '{flag=\$2; if(and(flag,16)) rev++; else fwd++} END {if(fwd+rev>0){frac=rev/(fwd+rev); bal=(fwd/(fwd+rev)<rev/(fwd+rev)?fwd/(fwd+rev):rev/(fwd+rev)); printf("%d\\t%d\\t%.3f\\t%.3f\\n",fwd,rev,frac,bal)} else print "0\\t0\\tNA\\tNA"}')
-    echo -e "\${chrom}\\t\${start}\\t\${end}\\t\${ref_name}\\t\${counts}"
-  done < $bed > ${sample}_frstrand_per_exon.tsv
-  """
-}
+// CoverageSummary, R1R2Ratio and ForwardReverseRatio were removed here.
+//
+// All three fed LeanReport and nothing else, and every column they produced
+// (ExonCov20/30/50/100, R1/R2/R1R2_frac/R1R2_abs, FWD/REV/FWD_frac/REV_frac/
+// FR_abs) was attached to the per-variant record and then dropped: none of the
+// 13 keys appears in any sheet's column list, and a real workbook has none of
+// them among its 54 columns. The HTML skeleton, DB_QC_EXPORT and MANIFEST do
+// not read them either.
+//
+// CoverageSummary was also the pipeline's slowest step on a large panel:
+// `bedtools coverage -d` emits one line per base of every interval, which on
+// the 28.3 Mb Morbid panel is 28.3M lines (~1.3 GB) per sample, written to
+// disk, re-read by awk, and published to the outdir -- ~700 min and an OOM
+// risk, since no -sorted flag means the BAM is loaded into memory.
+//
+// Per-exon coverage still comes from MosdepthRun (--thresholds 10,20,30,50,100),
+// which is what the Coverage gaps / Genes Coverage sheets and the
+// *_PctRegionsCovered metrics have always used.
+//
+// ForwardReverseRatio was additionally superseded by StrandBiasPileup: per-exon
+// read counting replaced by a per-variant, per-allele Fisher test (ALT_FWD,
+// ALT_REV, StrandBias_P, StrandBias).
 
 process SamtoolsFlagstat {
   tag { "${meta.sample} (${meta.assay})" } // meta is a map containing sample and assay
@@ -562,7 +522,7 @@ process LeanReport {
   publishDir "${params.outdir}/${meta.sample}/reports", mode: 'copy'
   input:
     tuple val(meta),
-          path(vcf), path(exon_cov), path(r1r2), path(frstrand),
+          path(vcf),
           path(flagstat), path(stats),
           path(mosdepth_summary),
           path(sex_check),
@@ -581,7 +541,7 @@ process LeanReport {
   """
   mkdir -p ${sample}_report
   python ${script} \
-    $vcf $exon_cov $r1r2 $frstrand ${sample}_report/${sample}_variants.xlsx \
+    $vcf ${sample}_report/${sample}_variants.xlsx \
     --sample-id ${sample} --assay ${meta.assay} --build GRCh38 \
     --flagstat ${flagstat} --stats ${stats} \
     --mosdepth-summary ${mosdepth_summary} \
@@ -708,9 +668,6 @@ workflow POST_SAREK {
     BedFilterBAM(sample_inputs.map { s, vcf, bam, bai -> tuple(s, vcf, bam) }, bed_ch)
     bam_sample_ch = BedFilterBAM.out.map { s, bam, bai -> tuple(s, bam, bai) }
 
-    CoverageSummary(bam_sample_ch.map { s, bam, bai -> tuple(s, bam) }, bed_ch)
-    R1R2Ratio(bam_sample_ch, bed_ch)
-    ForwardReverseRatio(bam_sample_ch, bed_ch)
     SamtoolsFlagstat(bam_sample_ch.map { s, bam, bai -> tuple(s, bam) })
     SamtoolsStats(bam_sample_ch.map { s, bam, bai -> tuple(s, bam) })
     MosdepthRun(bam_sample_ch, bed_ch)
@@ -751,7 +708,6 @@ workflow POST_SAREK {
     StrandBiasTest(StrandBiasPileup.out, strand_bias_script_ch)
 
     // prepare joins keyed by sample
-    exon_cov_ch         = CoverageSummary.out.map { s, summary, per_base -> tuple(s, summary) }
     gaps20_ch           = CoverageGapsAnnotation.out.map { s, g20, g30, a20, a30 -> tuple(s, a20) }
     gaps30_ch           = CoverageGapsAnnotation.out.map { s, g20, g30, a20, a30 -> tuple(s, a30) }
     mosdepth_summary_ch = MosdepthRun.out.map { s, summary, thresholds, quantized -> tuple(s, summary) }
@@ -759,9 +715,6 @@ workflow POST_SAREK {
 
     // join all for LeanReport
     lean_input_ch = vep_ch
-      .join(exon_cov_ch)
-      .join(R1R2Ratio.out)
-      .join(ForwardReverseRatio.out)
       .join(SamtoolsFlagstat.out)
       .join(SamtoolsStats.out)
       .join(mosdepth_summary_ch)

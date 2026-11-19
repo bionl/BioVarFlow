@@ -548,11 +548,29 @@ workflow RUN_FULL_VARIANT_CALLING {
         // carries errorStrategy 'ignore', and POST_SAREK substitutes a NO_FILE
         // placeholder for any sample it has no result for, so a failed or
         // skipped Exomiser costs those two tabs and nothing else.
+        //
+        // A missing --phenotypes DEGRADES rather than aborts: run_exomiser
+        // defaults to true, so erroring would kill a run over a default the user
+        // never set, and Exomiser is supplementary -- it costs these two tabs and
+        // nothing else. A clinical run must not die at construction time because
+        // an optional annotation has no inputs.
+        //
+        // A missing consensus is NOT treated the same way. create_consensus is
+        // not exposed in nextflow_schema.json and defaults to true, so it is not
+        // a user choice -- a null consensus channel means something upstream went
+        // wrong, and skipping silently would hide that. Keep it fatal.
+        //
+        // Note the skip is construction-time, so it is NOT covered by
+        // EXOMISER_BATCH's errorStrategy 'ignore' -- that only catches the task
+        // failing once submitted.
         exomiser_tsv_ch = Channel.empty()
-        if (params.run_exomiser) {
-            if (raw_consensus_ch == null) {
-                error "❌ --run_exomiser needs the consensus callset; run with --create_consensus."
-            }
+        if (params.run_exomiser && raw_consensus_ch == null) {
+            error "❌ --run_exomiser needs the consensus callset, but it is missing. " +
+                  "Consensus calling is always on (create_consensus defaults to true and is " +
+                  "not a user-facing option), so this indicates an upstream failure, not a setting."
+        }
+
+        if (params.run_exomiser && params.phenotypes) {
             EXOMISER(
                 raw_consensus_ch.map { sample, vcf, tbi ->
                     tuple([ sample: sample, assay: assayMap.get(sample, 'NA') ], vcf, tbi)
@@ -564,6 +582,11 @@ workflow RUN_FULL_VARIANT_CALLING {
                 .flatten()
                 .filter { f -> f.name.endsWith('_exomiser.variants.tsv') }
                 .map    { f -> tuple(f.name.replaceFirst(/_exomiser\.variants\.tsv$/, ''), f) }
+        }
+        else if (params.run_exomiser) {
+            log.warn "⚠️  Exomiser skipped: no --phenotypes <csv> supplied, so the 'Exomiser' and " +
+                     "'Prioritised' tabs will be absent. Columns: sample,sex,hpo -- Exomiser needs " +
+                     "at least one HPO term per sample."
         }
 
         // Strand bias tests off-panel variants too, and needs the unfiltered

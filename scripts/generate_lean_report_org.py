@@ -9,9 +9,6 @@ from urllib.parse import quote_plus, unquote
 # -------------------------
 p = argparse.ArgumentParser(description="Build LEAN Excel deliverable")
 p.add_argument("vcf", help="VCF (bgzip+tabix) with VEP+ClinVar if available")
-p.add_argument("coverage_summary", help="exon_coverage_summary.sorted.txt")
-p.add_argument("r1r2_summary", help="r1r2_per_exon.tsv")
-p.add_argument("fr_summary", help="frstrand_per_exon.tsv")
 p.add_argument("xlsx_out", help="output Excel path, e.g. results/sample.xlsx")
 
 # Optional QC inputs for Sample Summary (all optional)
@@ -741,51 +738,22 @@ def parse_spliceai(val):
             best_ds, best_event = ds, event
     return best_ds, best_event
 
-# -------------------------
-# Coverage summary loader (your format)
-# -------------------------
-coverage_data = {}
-with open(args.coverage_summary) as f:
-    for line in f:
-        parts = line.strip().split("\t")
-        if len(parts) < 5: continue
-        region = parts[0]             # e.g. "1:17018000-17019000"
-        cov = {}
-        for p in parts[1:]:
-            key, val = p.split(":")
-            cov[key.strip()] = val.strip().replace("%","")
-        coverage_data[region] = cov
-
-def get_exon_cov(chrom, pos):
-    for region, cov in coverage_data.items():
-        rchrom, coords = region.split(":")
-        start, end = map(int, coords.split("-"))
-        if str(chrom) == rchrom and start <= pos <= end:
-            return cov
-    return {">=20x":"NA", ">=30x":"NA", ">=50x":"NA", ">=100x":"NA"}
-
-# R1/R2 and FWD/REV
-r1r2_data = {}
-with open(args.r1r2_summary) as f:
-    for line in f:
-        chrom, start, end, gene, r1, r2, ratio = line.strip().split("\t")
-        r1r2_data[(chrom, int(start), int(end))] = (r1, r2, gene, ratio)
-
-def get_r1r2(chrom, pos):
-    for (c,s,e), vals in r1r2_data.items():
-        if str(chrom)==c and s<=pos<=e: return vals
-    return ("NA","NA","NA")
-
-fr_data = {}
-with open(args.fr_summary) as f:
-    for line in f:
-        chrom, start, end, gene, fwd, rev, ffrac, rfrac = line.strip().split("\t")
-        fr_data[(chrom, int(start), int(end))] = (gene, fwd, rev, ffrac, rfrac)
-
-def get_fr(chrom, pos):
-    for (c,s,e), vals in fr_data.items():
-        if str(chrom)==c and s<=pos<=e: return vals
-    return ("NA","NA","NA","NA")
+# ---------------------------------------------------------------------------
+# CoverageSummary / R1R2Ratio / ForwardReverseRatio loaders were removed here.
+#
+# They populated ExonCov20/30/50/100, R1/R2/R1R2_frac/R1R2_abs and
+# FWD/REV/FWD_frac/REV_frac/FR_abs on every variant record -- 13 keys, none of
+# which appeared in any sheet's column list, so all 13 were dropped again when
+# the workbook was written.
+#
+# Each loader also built a dict keyed by interval and looked it up with a LINEAR
+# SCAN per variant, i.e. three full passes over every panel interval for every
+# variant -- 68,855 intervals on the Morbid panel.
+#
+# Per-exon coverage comes from mosdepth via --acmg-thresholds, which is what the
+# Coverage gaps / Genes Coverage sheets and *_PctRegionsCovered have always used.
+# Per-allele strand counts come from strand_bias.py (ALT_FWD / ALT_REV).
+# ---------------------------------------------------------------------------
 
 # Optional SF gene list
 sf_genes = set()
@@ -869,9 +837,6 @@ for var in vcf:
         clinvar_review_status = ann.get("ClinVar_CLNREVSTAT") or ann.get("CLNREVSTAT")
         cadd        = ann.get("CADD_PHRED") or ann.get("CADDraw")
     
-    cov = get_exon_cov(chrom, pos)
-    r1r2 = get_r1r2(chrom, pos)
-    fr = get_fr(chrom, pos)
     revstat = clinvar_review_status if clinvar_review_status is not None else ""
     stars = clinvar_stars_from_revstat(revstat)
 
@@ -882,14 +847,6 @@ for var in vcf:
         if spliceai_scores else (None, None)
     )
 
-    try:
-        r1 = int(r1r2[0]); r2 = int(r1r2[1])
-        r1r2_abs = round(r1 / r2, 2) if r2 > 0 else None
-    except: r1r2_abs = None
-    try:
-        fwd = int(fr[0]); rev = int(fr[1])
-        fr_abs = round(fwd / rev, 2) if rev > 0 else None
-    except: fr_abs = None
 
     rec = {
         "Sample": sample_id,
@@ -905,12 +862,6 @@ for var in vcf:
         "GT": f"{gt[0]}/{gt[1]}",
         "AD_Ref": ad_ref, "AD_Alt": ad_alt,
         "DP": dp, "GQ": gq, "VAF": vaf, "Zygosity": zyg,
-        "ExonCov20": cov.get(">=20x","NA"),
-        "ExonCov30": cov.get(">=30x","NA"),
-        "ExonCov50": cov.get(">=50x","NA"),
-        "ExonCov100": cov.get(">=100x","NA"),
-        "R1": r1r2[0], "R2": r1r2[1], "R1R2_frac": r1r2[2], "R1R2_abs": r1r2_abs,
-        "FWD": fr[0], "REV": fr[1], "FWD_frac": fr[2], "REV_frac": fr[3], "FR_abs": fr_abs,
         "gnomAD_AF": gnomad_af, "REVEL": revel, "SpliceAI_DS_max": spliceai_ds, "SpliceAI_Event": spliceai_event, "BayesDel_score": bayesdel_score, "CADD": cadd, "AM_Pathogenicity": am_pathogenicity, "AM_Class": am_class,
         "ClinVar": clinvar, "ClinVar_ReviewStatus": revstat, "ClinVar_Stars": stars, "ALLELEID": alleleid, "ClinVar_ALLELEID": alleleid,  
         "ClinVar_StarsGlyph" : clinvar_star_glyph(stars),

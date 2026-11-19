@@ -5,8 +5,8 @@ Merge per-sample variant sheets into one cross-case table.
 Source sheet per case
 ---------------------
 Exomiser ranks a case's variants against its HPO terms, so where phenotype data
-exists the 'Prioritised' sheet is the right spine: ~12 rows instead of ~29, and
-it includes findings outside the 285-gene panel (NUP214 on IQMM, for instance).
+exists the 'Prioritised' sheet is the right spine: fewer rows, and it includes
+findings outside the capture panel.
 
 Exomiser will not run at all without at least one HPO term -- verified against
 15.1.0: a bare --vcf is refused with "No sample specified!", and a phenopacket
